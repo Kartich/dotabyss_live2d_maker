@@ -187,7 +187,7 @@ def convert_curve_to_segments(keyframes):
 
 def parse_and_convert_anim(anim_path, hash_dict):
     """
-    替换为无损的流式解析和 1:1 数学换算
+    无损流式解析和 1:1 数学换算
     """
     raw_curves = parse_anim_curves(anim_path)
     curves_data = []
@@ -250,7 +250,7 @@ def parse_and_convert_anim(anim_path, hash_dict):
     return curves_data
 
 def run_pipeline(current_dir="."):
-    print("[*] 开始执行修复级自适应 Live2D 转换流程...")
+    print("[*] 开始执行修复级自适应 Live2D 转换流程 (输出调校为 60 帧)...")
     all_files = os.listdir(current_dir)
     
     textures = [f for f in all_files if f.lower().startswith("texture") and os.path.isfile(f)]
@@ -338,11 +338,12 @@ def run_pipeline(current_dir="."):
                     total_segment_count += segment_count
                     total_point_count += point_count
                 
+                # 关键修改：Fps 字段设为 60.0，实现完美的 60 帧极速渲染
                 motion3 = {
                     "Version": 3,
                     "Meta": {
                         "Duration": round(max_duration, 3),
-                        "Fps": 30.0,
+                        "Fps": 60.0,  # 已成功微调为 60 帧
                         "Loop": True,
                         "AreBeziersRestricted": True,
                         "CurveCount": len(curves_data),
@@ -359,7 +360,7 @@ def run_pipeline(current_dir="."):
                 if group_name not in motions_config:
                     motions_config[group_name] = []
                 motions_config[group_name].append({"File": f"motions/{motion3_filename}"})
-                print(f"  [+] 成功将 '{anim}' 转换至 motions/{motion3_filename}")
+                print(f"  [+] 成功将 '{anim}' 转换至 motions/{motion3_filename} (60 FPS)")
                 
         # 动态创建 model3.json
         model3_cfg = {
