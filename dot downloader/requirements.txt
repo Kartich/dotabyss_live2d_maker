@@ -1,0 +1,3 @@
+Pillow
+lz4
+UnityPy==1.25.3

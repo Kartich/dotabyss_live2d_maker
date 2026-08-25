@@ -1,0 +1,24 @@
+仅供学习交流使用
+使用前请确保已自行在根目录放置或者更新catalog_1.bin
+【在获取catalog时请顺带确认url的版本识别号，在检索下载前会要求输入，如https://api.abyss-prod-r18.dotabyss.dmmgames.com/resources/webgl/r18/aas/8374/aa/   其中8374为版本识别号】
+
+01,03均可通过角色id下载对应角色的bundle（例如输入ID：102301001 这是8.20新角色的付费皮肤）
+02批量拖bundle进入bat即可开始转换
+03输入角色id即可进行自动下载和转换（一键一般用这个）
+---转换出来文件的存储结构与@yun编写的离线包结构一致，可作为补充包直接导入@yun编写的离线包中，导入后需要更新index索引以生效，内附带索引更新脚本 update_index.py 和 更新索引.bat 复制到启动器exe同目录下运行bat即可
+---对于转换出来的l2d模型，可以使用cubism viewer拖入model3.json进行查看
+---在转换完成后会进行一次对公用资源的检索下载，速度较慢
+---检查完毕后建议清理rawbundle，以免干扰
+
+动作转换方式为fade.asset与anim结合转换，motion3内配置以及Target尽量按照原文件数据，与@yun的版本有些许差别
+---对播放器尝试进行了部分优化，包括scene与其他motion的并行处理逻辑（但也只是好一点？比不上游戏原生的效果，会有一些吞动作，但总体勉强能看），可替换app.js进行测试
+---索引更新为根据现有文件进行逆向的产物，有概率有bug
+
+- AnimationClip 的 StreamedClip、DenseClip、ConstantClip 三种曲线通道现在都使用完整的 genericBinding（path + attribute + typeID）解析。
+- Unity 6 Bundle 中存在“genericBindings 正常、TypeTree 的 m_FloatCurves 为空、实际动画存放在 m_MuscleClip/m_Clip”的情况时，不再因为 TypeTree 仅有 bindings 就错误地覆盖真实曲线数据；会优先使用完整二进制 AnimationClip 解析结果。
+- Cubism 标准 Model Track（Opacity / EyeBlink / LipSync）通过原始 attribute hash 解析，不依赖 Story 或额外联动参数。
+- Parameter 曲线仍通过原始 Transform-path CRC 映射。
+- 不进行重采样、RDP 简化、循环补帧或人为修改曲线端点。
+- Fade 只负责 Fade 参数补充，不决定 Motion 曲线是否存在。
+
+
