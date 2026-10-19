@@ -1,7 +1,9 @@
 const DATA_ROOT = './data/';
+const PLAYER_NAME_URL = `${DATA_ROOT}player_name.txt`;
 const R18_DATA_ROOT = './data_r18_all/';
 const CHARA_DATA_ROOT = `${DATA_ROOT}chara/`;
 const CHARA_EMOTION_ROOT = `${DATA_ROOT}emotion/charastand/`;
+const EMOTION_KEYS = ["anger", "bepeevish", "dull", "elated", "exclamation", "exclaques", "flash", "flower", "heart", "imagination", "laugh", "panic", "question", "shock", "shy", "silence", "sleepy", "speak", "spirits", "sweat", "trouble", "twinkle"];
 const BG_DATA_ROOT = `${DATA_ROOT}backgrounds/novel/`;
 const LIVE2D_TAG = 'Live2DTag';
 const L2D_DEFAULT_IDLE_MOTION = 'scene01_loop';
@@ -30,6 +32,28 @@ const L2D_LIP_SYNC = {
   highFreqEnhancer: 100,
   maxMouthYSize: 150,
   webGLPeakLevelMultiplier: 7,
+  maxOpening: 1,
+  noiseFloorMin: 0.0025,
+  noiseGateMargin: 0.0025,
+  adaptivePeakFloor: 0.045,
+  adaptivePeakDecaySec: 1.15,
+  noiseFloorAdaptSec: 0.7,
+  attackSec: 0.026,
+  releaseSec: 0.072,
+  tailReleaseSec: 0.105,
+  endBlendSec: 0.24,
+  endCloseSec: 0.11,
+  syllableHoldSec: 0.018,
+  consonantReleaseSec: 0.032,
+  consonantCloseStrength: 0.48,
+  voicedOpenBoost: 0.10,
+  speechClosureBlend: 0.42,
+  safeAuthoredDrive: 0.72,
+  strongShapeDrive: 0.50,
+  mouthTransitionGuardSec: 0.10,
+  formDrive: 0.16,
+  formAttackSec: 0.045,
+  formReleaseSec: 0.075,
 };
 const AUTO_CHECK_MS = 100;
 const AUTO_AFTER_VOICE_MS = 350;
@@ -38,8 +62,303 @@ const MOSAIC_PIXEL_DIV_Y = 45;
 const MOSAIC_PADDING_PX = 2;
 const LIVE2D_STAGE_SCALE_X = 1;
 const SCENE_SHAKE_MAX_MS = 1800;
-const CHARA_BLINK_MS = 140;
 
+
+function safeStorageGet(key) {
+  try { return window.localStorage?.getItem(key) || ''; } catch (_) { return ''; }
+}
+
+function safeStorageSet(key, value) {
+  try { window.localStorage?.setItem(key, value); } catch (_) {}
+}
+
+
+
+// Compatibility and motion-processing support ported from the legacy player.
+const CHARA_BLINK_MS = 140;
+const JSON_FETCH_TIMEOUT_MS = 12000;
+const LIVE2D_MODEL_LOAD_TIMEOUT_MS = 15000;
+const LIVE2D_TEXTURE_COMPAT = {
+  alphaEdgeFix: true,
+  sampleStride: 8,
+  suspectAlphaMin: 4,
+  suspectAlphaMax: 96,
+  suspectScore: 0.52,
+  bleedAlphaMax: 104,
+  bleedPasses: 1,
+  unpremultiplyAlphaMin: 3,
+  unpremultiplyAlphaMax: 250,
+  unpremultiplyGate: 1.85,
+  unpremultiplyBias: 18,
+  minRendererResolution: 1.0,
+  maxRendererResolution: 1.25,
+  rendererPixelBudget: 2400000,
+  mouthMaskBufferLow: 384,
+  mouthMaskBufferHigh: 512,
+};
+
+function adaptiveVoiceMouthOpening(timeData, state, dt) {
+  if (!timeData?.length) return 0;
+  let sumSquares = 0;
+  let peakAbs = 0;
+  for (let i = 0; i < timeData.length; i += 1) {
+    const sample = (Number(timeData[i]) - 128) / 128;
+    const abs = Math.abs(sample);
+    sumSquares += sample * sample;
+    if (abs > peakAbs) peakAbs = abs;
+  }
+  const rms = Math.sqrt(sumSquares / timeData.length);
+  const frameDt = clamp(Number(dt) || 0.016, 0.001, 0.08);
+
+  let floor = Number(state.noiseFloor);
+  if (!Number.isFinite(floor)) floor = L2D_LIP_SYNC.noiseFloorMin;
+  let peak = Number(state.speechPeak);
+  if (!Number.isFinite(peak)) peak = L2D_LIP_SYNC.adaptivePeakFloor;
+
+  // Peak follows louder speech immediately and decays slowly, making quiet and
+  // loud voice files produce similar mouth ranges without pumping every frame.
+  const peakDecay = Math.exp(-frameDt / L2D_LIP_SYNC.adaptivePeakDecaySec);
+  peak = Math.max(rms, L2D_LIP_SYNC.adaptivePeakFloor, peak * peakDecay);
+
+  // Learn the recording's noise floor only on relatively quiet frames. This
+  // prevents breaths / room noise from holding the mouth slightly open.
+  if (rms < peak * 0.34 || rms < floor + 0.008) {
+    const floorAlpha = 1 - Math.exp(-frameDt / L2D_LIP_SYNC.noiseFloorAdaptSec);
+    const floorTarget = clamp(rms, L2D_LIP_SYNC.noiseFloorMin, 0.035);
+    floor = lerp(floor, floorTarget, floorAlpha);
+  }
+  floor = clamp(floor, L2D_LIP_SYNC.noiseFloorMin, Math.max(L2D_LIP_SYNC.noiseFloorMin, peak * 0.55));
+
+  const gateStart = floor + L2D_LIP_SYNC.noiseGateMargin;
+  const gateWidth = Math.max(0.008, (peak - floor) * 0.16);
+  const gate = smoothStep(clamp((rms - gateStart) / gateWidth, 0, 1));
+  const dynamicSpan = Math.max(0.018, peak - floor);
+  const normalized = clamp((rms - floor) / (dynamicSpan * 0.82), 0, 1);
+  const absolute = clamp(rms * L2D_LIP_SYNC.webGLPeakLevelMultiplier, 0, 1);
+  const crest = clamp((peakAbs - rms * 1.35) * 1.8, 0, 0.12);
+  const opening = clamp((normalized * 0.72 + absolute * 0.28 + crest) * gate, 0, 1);
+
+  state.noiseFloor = floor;
+  state.speechPeak = peak;
+  state.lastRms = rms;
+  state.lastOpening = opening;
+  return opening;
+}
+
+function analyzeVoiceSpectrum(frequencyData, sampleRate, fftSize, state, dt) {
+  if (!frequencyData?.length || !Number.isFinite(sampleRate) || !Number.isFinite(fftSize) || fftSize <= 0) {
+    return { voiced: Number(state.spectralVoiced) || 0, brightness: Number(state.spectralBrightness) || 0.35, consonant: 0 };
+  }
+  const binHz = sampleRate / fftSize;
+  let low = 0;
+  let mid = 0;
+  let high = 0;
+  for (let i = 1; i < frequencyData.length; i += 1) {
+    const hz = i * binHz;
+    if (hz < 80) continue;
+    if (hz > 8000) break;
+    const db = Number(frequencyData[i]);
+    if (!Number.isFinite(db) || db <= -120) continue;
+    const power = Math.pow(10, db / 10);
+    if (hz < 700) low += power;
+    else if (hz < 2600) mid += power;
+    else high += power;
+  }
+  const total = low + mid + high;
+  if (!(total > 1e-12)) {
+    return { voiced: 0, brightness: Number(state.spectralBrightness) || 0.35, consonant: 0 };
+  }
+  const lowRatio = low / total;
+  const midRatio = mid / total;
+  const highRatio = high / total;
+  const rawVoiced = clamp(lowRatio * 1.15 + midRatio * 0.62, 0, 1);
+  const rawBrightness = clamp(highRatio * 1.35 + midRatio * 0.28, 0, 1);
+  const rawConsonant = clamp((highRatio - 0.16) / 0.48, 0, 1) * clamp(1 - lowRatio * 0.72, 0, 1);
+  const tau = 0.045;
+  const alpha = 1 - Math.exp(-clamp(Number(dt) || 0.016, 0.001, 0.08) / tau);
+  state.spectralVoiced = lerp(Number(state.spectralVoiced) || rawVoiced, rawVoiced, alpha);
+  state.spectralBrightness = lerp(Number(state.spectralBrightness) || rawBrightness, rawBrightness, alpha);
+  state.spectralConsonant = lerp(Number(state.spectralConsonant) || rawConsonant, rawConsonant, Math.min(1, alpha * 1.55));
+  return {
+    voiced: clamp(state.spectralVoiced, 0, 1),
+    brightness: clamp(state.spectralBrightness, 0, 1),
+    consonant: clamp(state.spectralConsonant, 0, 1),
+  };
+}
+
+function createLive2DStraightAlphaCompatCanvas(source) {
+  const { width, height } = live2dTextureSourceSize(source);
+  if (!(width > 0 && height > 0)) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.clearRect(0, 0, width, height);
+  ctx.drawImage(source, 0, 0, width, height);
+  const image = ctx.getImageData(0, 0, width, height);
+  const data = image.data;
+
+  // Some exported Cubism atlases already contain RGB values that look
+  // premultiplied in their semi-transparent edge pixels. PIXI/Cubism then
+  // premultiplies the texture again on upload, producing dark blocky outlines
+  // around small mouth ArtMeshes. Convert only pixels that match that signature
+  // back to straight-alpha RGB; alpha and UVs are left untouched.
+  const alphaMin = LIVE2D_TEXTURE_COMPAT.unpremultiplyAlphaMin;
+  const alphaMax = LIVE2D_TEXTURE_COMPAT.unpremultiplyAlphaMax;
+  const gate = LIVE2D_TEXTURE_COMPAT.unpremultiplyGate;
+  const bias = LIVE2D_TEXTURE_COMPAT.unpremultiplyBias;
+  for (let i = 0; i < data.length; i += 4) {
+    const a = data[i + 3];
+    if (a < alphaMin || a > alphaMax) continue;
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const maxRgb = Math.max(r, g, b);
+    if (maxRgb > a * gate + bias) continue;
+    const gain = 255 / Math.max(1, a);
+    data[i] = clamp(Math.round(r * gain), 0, 255);
+    data[i + 1] = clamp(Math.round(g * gain), 0, 255);
+    data[i + 2] = clamp(Math.round(b * gain), 0, 255);
+  }
+
+  // A tiny colour dilation for very-low-alpha edge pixels reduces atlas-island
+  // stair stepping under bilinear sampling. We deliberately keep alpha exactly
+  // as authored so masks and mouth silhouettes are not enlarged.
+  const maxAlpha = LIVE2D_TEXTURE_COMPAT.bleedAlphaMax;
+  for (let pass = 0; pass < LIVE2D_TEXTURE_COMPAT.bleedPasses; pass += 1) {
+    const previous = new Uint8ClampedArray(data);
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const i = (y * width + x) * 4;
+        const a = previous[i + 3];
+        if (a <= 0 || a > maxAlpha) continue;
+        let best = -1;
+        let bestAlpha = a;
+        const neighbors = [i - 4, i + 4, i - width * 4, i + width * 4];
+        for (const n of neighbors) {
+          const na = previous[n + 3];
+          if (na > bestAlpha + 18) {
+            bestAlpha = na;
+            best = n;
+          }
+        }
+        if (best < 0) continue;
+        data[i] = previous[best];
+        data[i + 1] = previous[best + 1];
+        data[i + 2] = previous[best + 2];
+      }
+    }
+  }
+
+  ctx.putImageData(image, 0, 0);
+  return canvas;
+}
+
+function isLive2DRuntimeResetName(value) {
+  return /Reset(?:_N)?$/i.test(String(value || '').trim());
+}
+
+function live2dIdArray(source) {
+  if (!source) return [];
+  try {
+    if (Array.isArray(source)) return source.map(live2dIdString).filter(Boolean);
+    if (source instanceof Set) return Array.from(source, live2dIdString).filter(Boolean);
+    if (typeof source.getSize === 'function' && typeof source.at === 'function') {
+      const result = [];
+      for (let i = 0; i < source.getSize(); i += 1) result.push(live2dIdString(source.at(i)));
+      return result.filter(Boolean);
+    }
+    if (typeof source.length === 'number') return Array.from(source, live2dIdString).filter(Boolean);
+  } catch (_) {}
+  return [];
+}
+
+function live2dIdString(value) {
+  if (value == null) return '';
+  try {
+    const inner = value.getString?.();
+    if (inner?.s != null) return String(inner.s);
+    if (inner != null) return String(inner);
+  } catch (_) {}
+  if (value.s != null) return String(value.s);
+  return String(value);
+}
+
+function live2dModelCurveDefault(id) {
+  if (id === 'eyeBlink' || id === 'opacity') return 1;
+  return 0;
+}
+
+function live2dTexturePremultiplyEdgeScore(source) {
+  const { width, height } = live2dTextureSourceSize(source);
+  if (!(width > 0 && height > 0)) return 0;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return 0;
+  ctx.clearRect(0, 0, width, height);
+  ctx.drawImage(source, 0, 0, width, height);
+  const data = ctx.getImageData(0, 0, width, height).data;
+  let semi = 0;
+  let suspicious = 0;
+  const stride = Math.max(1, Number(LIVE2D_TEXTURE_COMPAT.sampleStride) || 1);
+  for (let i = 0; i < data.length; i += 4 * stride) {
+    const a = data[i + 3];
+    if (a < LIVE2D_TEXTURE_COMPAT.suspectAlphaMin || a > LIVE2D_TEXTURE_COMPAT.suspectAlphaMax) continue;
+    semi += 1;
+    const maxRgb = Math.max(data[i], data[i + 1], data[i + 2]);
+    if (maxRgb <= a * 1.4 + 8) suspicious += 1;
+  }
+  return semi >= 64 ? suspicious / semi : 0;
+}
+
+function live2dTextureSourceSize(source) {
+  const width = Number(source?.naturalWidth || source?.videoWidth || source?.width || 0);
+  const height = Number(source?.naturalHeight || source?.videoHeight || source?.height || 0);
+  return { width, height };
+}
+
+function normalizeLive2DModelCurveId(id) {
+  const key = normalizeKey(id);
+  if (key === 'eyeblink') return 'eyeBlink';
+  if (key === 'lipsync') return 'lipSync';
+  if (key === 'opacity' || key === 'modelopacity') return 'opacity';
+  return key || '';
+}
+
+function promiseWithTimeout(promise, timeoutMs, message = 'operation timeout') {
+  if (!(timeoutMs > 0)) return promise;
+  let timer = 0;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function resolveLive2DGroup(group, motionName = '') {
+  const rawGroup = String(group || '').trim();
+  const rawName = String(motionName || '').trim();
+  for (const candidate of [rawGroup, rawName]) {
+    const key = normalizeKey(candidate);
+    if (!key) continue;
+    if (key === 'idle') return 'Scene';
+    for (const known of L2D_GROUP_PRIORITY) {
+      const knownKey = normalizeKey(known);
+      if (key === knownKey || key.startsWith(knownKey)) return known;
+    }
+  }
+  return rawGroup || rawName || 'default';
+}
+
+function stripLive2DResetSuffix(value) {
+  return String(value || '').trim().replace(/Reset(?:_N)?$/i, '');
+}
 
 const el = {};
 const app = {
@@ -57,6 +376,8 @@ const app = {
   fastForward: false,
   fastForwardGeneration: 0,
   aspect169: false,
+  language: (safeStorageGet("dotabyss-language") === "ja" ? "ja" : "cn"),
+  playerName: "",
   runToken: 0,
   asyncToken: 0,
   labels: new Map(),
@@ -73,12 +394,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   app.registry = buildCommandRegistry();
   app.controller = new NovelModelController();
   exposeManualReader();
+  updateLanguageButtons();
+  await loadPlayerName();
   await loadIndex();
 });
 
 function bindElements() {
   for (const id of [
     'characterView', 'roomView', 'playView', 'characterGrid', 'backToCharactersBtn',
+    'languageToggleBtn', 'roomLanguageToggleBtn', 'playerNameBtn', 'roomPlayerNameBtn',
     'backToRoomsBtn', 'settingsBtn', 'settingsPanel', 'closeSettingsBtn', 'roomCharacterName', 'roomCount',
     'storyCount', 'storyList', 'storyTitle', 'storyMeta', 'stage', 'live2dCanvas',
     'bgLayer', 'mosaicLayer', 'fallbackTexture', 'sceneLayer', 'screenEffectLayer', 'transitionLayer', 'fadeLayer', 'motionBadge', 'statusLine',
@@ -97,6 +421,10 @@ function bindEvents() {
     showView('rooms');
   });
   el.settingsBtn.addEventListener('click', () => toggleSettingsPanel());
+  for (const button of [el.playerNameBtn, el.roomPlayerNameBtn]) button?.addEventListener('click', editPlayerName);
+  for (const button of [el.languageToggleBtn, el.roomLanguageToggleBtn]) {
+    button?.addEventListener('click', () => toggleLanguage());
+  }
   el.closeSettingsBtn.addEventListener('click', () => closeSettingsPanel());
   el.nextBtn.addEventListener('click', () => { app.controller.sound.unlock(); nextText(); });
   el.prevBtn.addEventListener('click', () => { app.controller.sound.unlock(); previousText(); });
@@ -170,13 +498,20 @@ async function loadIndex() {
   app.index = { ...primaryIndex, stories: Array.from(storiesById.values()) };
   buildCharacterRooms(characterIndex.characters || []);
   app.globalAudio = await loadGlobalAudioSources();
-  const emotionIndex = await fetchJsonOptional(`${CHARA_EMOTION_ROOT}index.json`, { emotions: [] });
-  app.emotionAssets = new Map((emotionIndex.emotions || []).map((item) => [normalizeAssetKey(item.id), item]));
+  app.emotionAssets = await loadEmotionAssetsFromParts();
   const backgroundIndex = await fetchJsonOptional(`${BG_DATA_ROOT}index.json`, { backgrounds: {} });
   app.backgroundAssets = new Map(Object.entries(backgroundIndex.backgrounds || {}).map(([key, item]) => [normalizeAssetKey(key), item]));
   el.storyCount.textContent = `${app.characters.length} characters / ${app.index.stories.length} rooms`;
   renderCharacterSelect();
   showView('characters');
+}
+
+async function loadEmotionAssetsFromParts() {
+  const entries = await Promise.all(EMOTION_KEYS.map(async (id) => {
+    const item = await fetchJsonOptional(`${CHARA_EMOTION_ROOT}parts/${id}/meta.json`, null);
+    return item ? [normalizeAssetKey(id), item] : null;
+  }));
+  return new Map(entries.filter(Boolean));
 }
 
 function buildCharacterRooms(characterEntries) {
@@ -230,12 +565,70 @@ function buildCharacterRooms(characterEntries) {
 async function loadGlobalAudioSources() {
   const sources = [];
   for (const root of [DATA_ROOT, R18_DATA_ROOT]) {
-    const index = await fetchJsonOptional(`${root}audio/se/index.json`, null);
-    if (index?.cues) sources.push({ basePath: root, cues: index.cues });
+    for (const audioIndex of ['audio/se/index.json', 'audio/BGM/index.json']) {
+      const index = await fetchJsonOptional(`${root}${audioIndex}`, null);
+      if (index?.cues) sources.push({ basePath: root, cues: index.cues });
+    }
   }
   return { sources };
 }
 
+async function loadPlayerName() {
+  let fileName = '';
+  try {
+    const response = await fetch(PLAYER_NAME_URL, { cache: 'no-store' });
+    if (response.ok) fileName = (await response.text()).trim();
+  } catch (_) {}
+  app.playerName = fileName || safeStorageGet('dotabyss-player-name') || '';
+}
+
+function editPlayerName() {
+  const next = window.prompt('请输入主角名字：', app.playerName || '');
+  if (next == null) return;
+  const name = next.trim();
+  app.playerName = name;
+  safeStorageSet('dotabyss-player-name', name);
+  fetch('/__player_name', { method: 'POST', headers: { 'Content-Type': 'text/plain; charset=utf-8' }, body: name }).catch(() => {});
+}
+
+function replacePlayerName(text) {
+  return String(text || '').replace(/<user>/gi, app.playerName || '<user>');
+}
+
+function updateLanguageButtons() {
+  const isCn = app.language !== 'ja';
+  for (const button of [el.languageToggleBtn, el.roomLanguageToggleBtn]) {
+    if (!button) continue;
+    button.textContent = isCn ? '中文' : '日本語';
+    button.title = isCn ? '当前为中文，点击切换日文' : '当前为日文，点击切换中文';
+    button.setAttribute('aria-label', button.title);
+  }
+}
+
+async function toggleLanguage() {
+  app.language = app.language === 'ja' ? 'cn' : 'ja';
+  safeStorageSet('dotabyss-language', app.language);
+  updateLanguageButtons();
+}
+
+function chineseStoryUrl(meta) {
+  const root = meta?.dataRoot || DATA_ROOT;
+  if (root !== R18_DATA_ROOT) return null;
+  const path = String(meta.path || '').replace(/^stories\//, 'stories_cn/');
+  return `${root}${path}`;
+}
+
+async function loadStoryData(meta) {
+  const japaneseUrl = `${meta.dataRoot || DATA_ROOT}${meta.path}`;
+  if (app.language === 'cn') {
+    const chineseUrl = chineseStoryUrl(meta);
+    if (chineseUrl) {
+      const chinese = await fetchJsonOptional(chineseUrl, null);
+      if (chinese) return { data: chinese, root: R18_DATA_ROOT, path: String(meta.path).replace(/^stories\//, 'stories_cn/') };
+    }
+  }
+  return { data: await fetchJson(japaneseUrl), root: meta.dataRoot || DATA_ROOT, path: meta.path };
+}
 async function loadStory(storyId) {
   const meta = app.index.stories.find((story) => story.id === storyId);
   if (!meta) return;
@@ -255,7 +648,10 @@ async function loadStory(storyId) {
   }
   app.storyMeta = meta;
 
-  const storyData = await fetchJson(`${meta.dataRoot || DATA_ROOT}${meta.path}`);
+  const loaded = await loadStoryData(meta);
+  const storyData = loaded.data;
+  app.storyDataRoot = loaded.root;
+  app.storyDataPath = loaded.path;
 
   if (currentAsyncToken !== app.asyncToken) {
     return; 
@@ -266,7 +662,7 @@ async function loadStory(storyId) {
   app.running = false;
   app.labels = buildLabels(app.script.commands);
   
-  const basePath = storyBasePath(meta);
+  const basePath = storyBasePath();
   app.controller.reset(app.story, basePath);
   app.controller.live2d.setMosaicMode(el.mosaicMode.value);
   await app.controller.live2d.loadStory(app.story, basePath);
@@ -298,6 +694,7 @@ function buildLabels(commands) {
 }
 
 function storyBasePath(meta = app.storyMeta) {
+  // 中文模式只替换 story.json；Live2D、音频等资源继续从日文故事目录读取。
   const root = meta?.dataRoot || DATA_ROOT;
   const path = String(meta?.path || `stories/${app.story?.id || ''}/story.json`);
   const slash = path.lastIndexOf('/');
@@ -462,15 +859,15 @@ function roomDisplayName(story) {
 
 function renderCommandList() {
   el.commandList.innerHTML = '';
-  for (const [position, command] of app.script.commands.entries()) {
+  for (const command of app.script.commands) {
     const item = document.createElement('div');
     item.className = 'command-item';
-    item.dataset.index = String(position);
+    item.dataset.index = command.index;
     item.innerHTML = `
-      <div>${String(command.index).padStart(4, '0')} ${escapeHtml(command.rawCommand || command.command)}</div>
+      <div>${command.index.toString().padStart(4, '0')} ${escapeHtml(command.rawCommand || command.command)}</div>
       <div class="command-meta">${escapeHtml((command.args || []).join(' | '))}</div>
     `;
-    item.addEventListener('click', () => jumpTo(position));
+    item.addEventListener('click', () => jumpTo(command.index));
     el.commandList.appendChild(item);
   }
 }
@@ -523,26 +920,21 @@ async function executeAt(index, token, replaying, replayTargetIndex = -1) {
   app.current = index;
   const context = new NovelContext(app, app.controller, token, replaying, replayTargetIndex);
   const result = await app.registry.execute(context, command);
-
-  // Seek/replay is a state reconstruction pass, not visible playback.
-  // Intermediate commands must not render, update the progress UI, or incur
-  // artificial delays; only the final target state is committed visually.
-  if (!replaying) {
-    app.controller.scene.render();
-    updatePosition();
-    updateInspectors();
+  app.controller.scene.render();
+  updatePosition();
+  updateInspectors();
+  if (replaying) {
+    await new Promise(resolve => setTimeout(resolve, 5));
   }
-
   return result;
 }
 
 async function previousText() {
   if (!app.script) return;
   const textIndexes = app.script.commands
-    .map((command, position) => ({ command, position }))
-    .filter(({ command }) => isTextPauseCommand(command.command))
-    .map(({ position }) => position)
-    .filter((position) => position < app.current);
+    .filter((command) => isTextPauseCommand(command.command))
+    .map((command) => command.index)
+    .filter((index) => index < app.current);
   const target = textIndexes.length ? textIndexes[textIndexes.length - 1] : 0;
   await replayTo(target);
 }
@@ -553,36 +945,26 @@ async function jumpTo(index) {
 
 async function replayTo(index) {
   stopAuto();
-  stopFastForward(false);
   const token = ++app.runToken;
   app.asyncToken += 1;
   const currentAsyncToken = app.asyncToken;
   const basePath = storyBasePath();
-
-  // Rebuild the scene from a clean state. During this pass replaying=true keeps
-  // waits/async delays non-blocking; executeAt() also suppresses all visual
-  // commits until the requested command has been reconstructed.
   app.controller.reset(app.story, basePath);
   await app.controller.live2d.loadStory(app.story, basePath);
   if (currentAsyncToken !== app.asyncToken) return;
   app.controller.sound.loadStory(app.story, basePath);
   app.current = -1;
-
   for (let i = 0; i <= index; i += 1) {
-    const result = await executeAt(i, token, true, index);
+    const isLastFrame = (i === index);
+    const result = await executeAt(i, token, isLastFrame ? false : true, index);
     if (token !== app.runToken) return;
     if (result?.jumpIndex != null && result.jumpIndex <= index) i = result.jumpIndex - 1;
   }
-
-  app.current = clamp(index, 0, app.script.commands.length - 1);
-  app.running = false;
-
-  // One and only one visible commit after the final state has been rebuilt.
+  app.running = false; 
+  await new Promise(resolve => setTimeout(resolve, 5));
   if (app.controller.scene && typeof app.controller.scene.render === 'function') {
     app.controller.scene.render();
   }
-  updatePosition();
-  updateInspectors();
   const voiceCue = app.controller.message.state.voiceCue;
   
   try {
@@ -592,11 +974,12 @@ async function replayTo(index) {
   if (voiceCue) {
     const voiceFactor = window.app?.config?.voiceVolume ?? 1.0;
     app.controller.sound.play(voiceCue, 'voice', 'voice', { volume: voiceFactor });
-    app.controller.live2d.playLipSync(voiceCue, true);
 
     const currentLockId = Date.now() + '_' + Math.random();
     app.controller.sound._activeVoiceLockId = currentLockId;
 
+    // Register the active voice before starting lip-sync: playLipSync validates
+    // this channel and otherwise immediately cancels its own state.
     window._liveChannels = window._liveChannels || {};
     window._liveChannels['voice'] = {
       type: 'voice',
@@ -604,6 +987,7 @@ async function replayTo(index) {
       soundModel: app.controller.sound,
       voiceLockId: currentLockId
     };
+    app.controller.live2d.playLipSync(voiceCue, true);
   } else {
     if (window._liveChannels) delete window._liveChannels['voice'];
     if (app.controller.sound) app.controller.sound._activeVoiceLockId = null;
@@ -747,7 +1131,7 @@ function stopAuto() {
 function completeCurrentMessagePause() {
   const command = app.script?.commands?.[app.current];
   if (!command || !isTextPauseCommand(command.command)) return;
-  app.controller.sound.stopVoiceAll();
+  // 保留上一句语音，直到下一条语音播放时由同一声道替换。
   app.controller.live2d.stopLipSync();
 }
 
@@ -868,10 +1252,12 @@ class NovelModelMessage {
   }
 
   show(speaker, text, voiceCue = '') {
-    this.state = { speaker, text, voiceCue, visible: true, shownAt: performance.now() };
-    el.speaker.textContent = speaker || '';
-    el.message.innerHTML = escapeHtml(text || '').replace(/&lt;br&gt;/g, '<br>');
-    el.messageBox.classList.toggle('thought-message', isThoughtMessage(text));
+    const resolvedSpeaker = replacePlayerName(speaker);
+    const resolvedText = replacePlayerName(text);
+    this.state = { speaker: resolvedSpeaker, text: resolvedText, voiceCue, visible: true, shownAt: performance.now() };
+    el.speaker.textContent = resolvedSpeaker || '';
+    el.message.innerHTML = escapeHtml(resolvedText || '').replace(/&lt;br&gt;/g, '<br>');
+    el.messageBox.classList.toggle('thought-message', isThoughtMessage(resolvedText));
     el.messageBox.style.opacity = '1';
   }
 
@@ -1163,9 +1549,7 @@ class NovelModelScene {
     target.visible = target.visible === true;
     target.alpha = Number.isFinite(target.alpha) ? target.alpha : 0;
     target.baseFace = target.baseFace || 'normal';
-    target.eyeClosed = false;
-    target.eyeBlinkUntil = 0;
-    target.eyeBlinkNonce = 0;
+    target.eyeClosed = !!target.eyeClosed;
     target.transitionSeconds = 0;
     return target;
   }
@@ -1188,22 +1572,11 @@ class NovelModelScene {
     target.lastFaceCommand = faceName;
     target.transitionSeconds = 0;
     if (normalized === 'closed') {
-      const nonce = ++target.eyeBlinkNonce;
       target.eyeClosed = true;
-      target.eyeBlinkUntil = performance.now() + CHARA_BLINK_MS;
-      window.setTimeout(() => {
-        if (target.eyeBlinkNonce === nonce && performance.now() >= target.eyeBlinkUntil) {
-          target.eyeClosed = false;
-          target.eyeBlinkUntil = 0;
-          this.render();
-        }
-      }, CHARA_BLINK_MS + 8);
       return;
     }
     if (normalized === 'eyeopen') {
-      target.eyeBlinkNonce += 1;
       target.eyeClosed = false;
-      target.eyeBlinkUntil = 0;
       return;
     }
     target.baseFace = normalized || 'normal';
@@ -1329,10 +1702,6 @@ class NovelModelScene {
   setBackground(backgroundName, applyCharaColor = true) {
     const key = normalizeAssetKey(backgroundName);
     if (!key) return;
-    if (!app.backgroundAssets.has(key)) {
-      setStatus(`background asset missing: ${backgroundName}`, true);
-      return;
-    }
     this.state.background = { name: key, rawName: backgroundName, applyCharaColor };
     el.stage.dataset.background = key;
     el.bgLayer.dataset.background = key;
@@ -1839,7 +2208,6 @@ class NovelModelScene {
         <div class="scene-character-body">
           <img class="scene-character-body-image" alt="">
           <img class="scene-character-face-image" alt="">
-          <img class="scene-character-eye-image" alt="">
         </div>
         <div class="scene-character-emotion"></div>
       `;
@@ -1882,7 +2250,6 @@ class NovelModelScene {
     const body = node.querySelector('.scene-character-body');
     const bodyImage = node.querySelector('.scene-character-body-image');
     const faceImage = node.querySelector('.scene-character-face-image');
-    const eyeImage = node.querySelector('.scene-character-eye-image');
     const bodyRect = item.asset.bodyRect || {};
     const faceRect = item.asset.faceContentRect || {};
     const bodySize = rectSize(bodyRect, 1024, 1600);
@@ -1904,21 +2271,15 @@ class NovelModelScene {
       bodyImage.dataset.src = bodySrc;
     }
 
-    const faceSize = rectSize(faceRect, 256, 256);
-    const facePosition = rectPosition(faceRect);
-    for (const image of [faceImage, eyeImage]) {
-      image.style.width = `${faceSize.x * unitScale}px`;
-      image.style.height = `${faceSize.y * unitScale}px`;
-      image.style.left = `calc(50% + ${facePosition.x * unitScale}px)`;
-      image.style.top = `calc(50% + ${-facePosition.y * unitScale}px)`;
-    }
-
-    // EyeClose/EyeOpen are transient commands. Closed.png is rendered by the
-    // same face <img> as normal expressions so it keeps identical sizing,
-    // pivot, and FaceContent positioning. Never stack a second face image.
-    const faceSrc = this.characterBaseFaceUrl(item);
+    const faceSrc = this.characterFaceUrl(item);
     if (faceSrc) {
+      const faceSize = rectSize(faceRect, 256, 256);
+      const facePosition = rectPosition(faceRect);
       faceImage.hidden = false;
+      faceImage.style.width = `${faceSize.x * unitScale}px`;
+      faceImage.style.height = `${faceSize.y * unitScale}px`;
+      faceImage.style.left = `calc(50% + ${facePosition.x * unitScale}px)`;
+      faceImage.style.top = `calc(50% + ${-facePosition.y * unitScale}px)`;
       if (faceImage.dataset.src !== faceSrc) {
         faceImage.src = faceSrc;
         faceImage.dataset.src = faceSrc;
@@ -1928,10 +2289,6 @@ class NovelModelScene {
       faceImage.removeAttribute('src');
       faceImage.dataset.src = '';
     }
-    eyeImage.hidden = true;
-    eyeImage.removeAttribute('src');
-    eyeImage.dataset.src = '';
-
   }
 
   renderCharacterEmotion(node, item, unitScale) {
@@ -2032,22 +2389,10 @@ class NovelModelScene {
     }
   }
 
-  characterBaseFaceUrl(item) {
+  characterFaceUrl(item) {
     const faces = item.asset?.faces || {};
     const faceKey = currentCharaFaceKey(item);
     const path = faces[faceKey] || faces[item.baseFace] || faces.normal || Object.values(faces)[0];
-    return path ? `${item.assetBase}${path}` : '';
-  }
-
-  characterEyeUrl(item) {
-    if (!item.eyeClosed) return '';
-    if (Number(item.eyeBlinkUntil) > 0 && performance.now() >= Number(item.eyeBlinkUntil)) {
-      item.eyeClosed = false;
-      item.eyeBlinkUntil = 0;
-      return '';
-    }
-    const faces = item.asset?.faces || {};
-    const path = faces.closed || faces.eyeclose || '';
     return path ? `${item.assetBase}${path}` : '';
   }
 }
@@ -2117,6 +2462,7 @@ class NovelModelSound {
     audio.pause();
     audio.src = `${basePath}${cue.path}`;
     audio.dataset.fallbackSrc = cue.fallbackPath ? `${basePath}${cue.fallbackPath}` : '';
+    audio.dataset.directSe = cue.directSe ? 'true' : 'false';
     const targetVolume = clamp(options.volume ?? 1, 0, 1);
     const fadeInSeconds = Math.max(0, Number(options.fadeInSeconds) || 0);
     audio.volume = fadeInSeconds > 0 ? 0 : targetVolume;
@@ -2132,7 +2478,14 @@ class NovelModelSound {
     audio.dataset.startedAt = String(performance.now());
     audio.dataset.triedFallback = 'false';
     audio.currentTime = 0;
-    if (channel === 'voice') this.attachVoiceAnalyser(key, audio);
+    if (channel === 'voice') {
+      try { this.attachVoiceAnalyser(key, audio); }
+      catch (error) {
+        // Web Audio analysis is optional; do not prevent the audio element
+        // from playing when analyser/source creation is unavailable.
+        console.warn('[lip-sync] voice analyser unavailable; using audio-clock fallback', error);
+      }
+    }
     try { this.audioContext?.resume?.(); } catch (_) {}
     audio.play().catch((error) => {
       const blocked = error?.name === 'NotAllowedError';
@@ -2192,6 +2545,10 @@ class NovelModelSound {
       const globalCue = source.cues?.[exactName] || source.cues?.[safeName];
       if (globalCue) return { cue: globalCue, basePath: source.basePath };
     }
+    // SE 可直接放在 data_r18_all/audio/se/decoded/misc，无需 index.json。
+    if (/^se[\w-]+$/i.test(exactName)) {
+      return { cue: { name: exactName, category: 'se', path: `audio/se/decoded/misc/${exactName}.wav`, fallbackPath: `audio/se/decoded/misc/${exactName}.ogg`, duration: 0, directSe: true }, basePath: R18_DATA_ROOT };
+    }
     return null;
   }
 
@@ -2230,6 +2587,7 @@ class NovelModelSound {
         });
         return;
       }
+      if (audio.dataset.directSe === 'true') setStatus(`missing cue: ${audio.dataset.cue}`, true);
       audio.dataset.status = 'error';
       this.cleanupLiveChannelForAudio(audio);
     });
@@ -2305,7 +2663,9 @@ class NovelModelSound {
       const source = context.createMediaElementSource(audio);
       const analyser = context.createAnalyser();
       analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.15;
+      // Keep analyser smoothing low; envelope smoothing is handled below so
+      // syllable attacks remain responsive.
+      analyser.smoothingTimeConstant = 0.06;
       source.connect(analyser);
       analyser.connect(context.destination);
       item = {
@@ -2314,6 +2674,14 @@ class NovelModelSound {
         data: new Float32Array(analyser.frequencyBinCount),
         timeData: new Uint8Array(analyser.fftSize),
         audio,
+        lipSyncEnvelope: {
+          noiseFloor: L2D_LIP_SYNC.noiseFloorMin,
+          speechPeak: L2D_LIP_SYNC.adaptivePeakFloor,
+          spectralVoiced: 0.5,
+          spectralBrightness: 0.35,
+          spectralConsonant: 0,
+          lastNow: performance.now(),
+        },
       };
       this.mediaSources.set(audio, item);
     }
@@ -2341,17 +2709,60 @@ class NovelModelSound {
     return this.cueDuration(cueName);
   }
 
-  currentVoiceMouthOpening() {
+  currentVoiceLipFeatures() {
     const item = this.currentVoiceAnalyser();
-    if (!item) return 0;
-    item.analyser.getByteTimeDomainData(item.timeData);
+    if (!item) {
+      // Keep lip-sync working if Web Audio analysis is unavailable or the
+      // analyser has not attached yet. The original app used the playing
+      // audio element's clock for this fallback.
+      const audio = Array.from(this.elements.values()).find((candidate) =>
+        candidate?.dataset?.channel === 'voice' && candidate.src && !candidate.paused && !candidate.ended
+      );
+      return {
+        opening: audio ? this.syntheticVoiceMouthOpening(audio) : 0,
+        voiced: 0,
+        brightness: 0.35,
+        consonant: 0,
+      };
+    }
+    try { item.analyser.getByteTimeDomainData(item.timeData); } catch (_) {}
+    try { item.analyser.getFloatFrequencyData(item.data); } catch (_) {}
+    const now = performance.now();
+    const envelope = item.lipSyncEnvelope || (item.lipSyncEnvelope = {
+      noiseFloor: L2D_LIP_SYNC.noiseFloorMin,
+      speechPeak: L2D_LIP_SYNC.adaptivePeakFloor,
+      spectralVoiced: 0.5,
+      spectralBrightness: 0.35,
+      spectralConsonant: 0,
+      lastNow: now,
+    });
+    const dt = Math.min(0.08, Math.max(0.001, (now - Number(envelope.lastNow || now)) / 1000));
+    envelope.lastNow = now;
+    const adaptiveOpeningRaw = adaptiveVoiceMouthOpening(item.timeData, envelope, dt);
+    const adaptiveOpening = Number.isFinite(Number(adaptiveOpeningRaw))
+      ? clamp(Number(adaptiveOpeningRaw), 0, 1)
+      : 0;
+    // Retain the original app.js RMS detector as a floor. The adaptive
+    // spectral detector can otherwise classify quiet speech as silence.
     let sumSquares = 0;
     for (let i = 0; i < item.timeData.length; i += 1) {
-      const normalized = (item.timeData[i] - 128) / 128;
-      sumSquares += normalized * normalized;
+      const sample = (Number(item.timeData[i]) - 128) / 128;
+      sumSquares += sample * sample;
     }
-    const rms = Math.sqrt(sumSquares / item.timeData.length);
-    return clamp(rms * 5.5, 0, 1);
+    const rmsOpening = clamp(Math.sqrt(sumSquares / Math.max(1, item.timeData.length)) * 5.5, 0, 1);
+    const opening = Math.max(adaptiveOpening, rmsOpening);
+    const spectrum = analyzeVoiceSpectrum(
+      item.data,
+      Number(this.audioContext?.sampleRate) || 48000,
+      Number(item.analyser.fftSize) || 1024,
+      envelope,
+      dt,
+    );
+    return { opening, ...spectrum };
+  }
+
+  currentVoiceMouthOpening() {
+    return this.currentVoiceLipFeatures().opening;
   }
 
   syntheticVoiceMouthOpening(audio) {
@@ -2476,6 +2887,7 @@ class NovelModelLive2D {
     this.motionMap = new Map();
     this.groupParameterIds = new Map();
     this.mouthParameterIds = new Set();
+    this.authoredParameterRanges = new Map();
     this.motionGeneration = new Map();
     this.motionQueues = new Map();
     this.parameterLayers = new Map();
@@ -2483,14 +2895,20 @@ class NovelModelLive2D {
     // applied as deltas from these authored starting values.
     this.motionLayerReferences = new Map();
     this.lastMotionByGroup = new Map();
+    this.activeMotionByGroup = new Map();
+    this.partOpacityLayers = new Map();
+    this.partOpacityDefaults = new Map();
+    this.modelEffectLayers = new Map();
     this.heldParameters = new Map();
     this.appliedParameterIds = new Set();
+    this.appliedPartOpacityIds = new Set();
     this.holdFrame = 0;
     this.live2dMotionUpdateHandler = null;
     this.live2dUpdateHandler = null;
     this.live2dUpdateHookInstalled = false;
     this.currentMotion = '';
     this.lipSync = null;
+    this.lipSyncMode = 'multi';
     this.lipSyncModeMulti = true;
     this.mosaicMode = 'original';
     this.mosaicDrawables = [];
@@ -2499,6 +2917,7 @@ class NovelModelLive2D {
     this.mosaicScratch = document.createElement('canvas');
     this.mosaicStatus = 'uninitialized';
     this.mosaicDrawPatchInstalled = false;
+    this.compatTextureObjects = [];
   }
 
   reset() {
@@ -2509,20 +2928,31 @@ class NovelModelLive2D {
     this.motionMap.clear();
     this.groupParameterIds.clear();
     this.mouthParameterIds.clear();
+    this.authoredParameterRanges.clear();
     this.motionGeneration.clear();
     this.motionQueues.clear();
     this.parameterLayers.clear();
     this.motionLayerReferences.clear();
     this.lastMotionByGroup.clear();
+    this.activeMotionByGroup.clear();
+    this.partOpacityLayers.clear();
+    this.partOpacityDefaults.clear();
+    this.modelEffectLayers.clear();
     this.heldParameters.clear();
     this.appliedParameterIds.clear();
+    this.appliedPartOpacityIds.clear();
     this.lipSync = null;
+    this.lipSyncMode = 'multi';
     this.lipSyncModeMulti = true;
     this.mosaicDrawables = [];
     this.backgroundDrawables = [];
     this.backgroundIndexSet.clear();
     this.mosaicStatus = 'uninitialized';
     this.mosaicDrawPatchInstalled = false;
+    for (const texture of this.compatTextureObjects) {
+      try { texture?.destroy?.(true); } catch (_) {}
+    }
+    this.compatTextureObjects = [];
     this.clearMosaicOverlay();
     if (this.holdFrame) cancelAnimationFrame(this.holdFrame);
     this.holdFrame = 0;
@@ -2558,9 +2988,17 @@ class NovelModelLive2D {
     }
     try {
       this.ensurePixi();
-      this.model = await window.PIXI.live2d.Live2DModel.from(`${basePath}${story.live2d.model3}`);
+      const modelUrl = `${basePath}${story.live2d.model3}`;
+      this.model = await promiseWithTimeout(
+        window.PIXI.live2d.Live2DModel.from(modelUrl),
+        LIVE2D_MODEL_LOAD_TIMEOUT_MS,
+        `Live2D model load timeout: ${modelUrl}`,
+      );
       this.model.visible = false;
       this.model.autoInteract = false;
+      this.configureLive2DRendererAlpha();
+      this.configureLive2DMaskQuality();
+      this.normalizeLive2DTextureEdges();
       this.disableSdkIdleMotion();
       this.disableSdkNaturalMotion();
       this.app.stage.addChild(this.model);
@@ -2569,6 +3007,9 @@ class NovelModelLive2D {
       this.cacheMosaicDrawables();
       this.cacheBackgroundDrawables();
       this.installMosaicDrawableSuppression();
+      // Parameter composition is driven by our own RAF hold loop. Do not hook
+      // Cubism's internal update events here: some exported models/runtimes can
+      // re-enter model updates and make loading appear to hang.
       this.ensureParameterHoldLoop();
       this.fit();
       setStatus('Live2D ready');
@@ -2664,10 +3105,27 @@ class NovelModelLive2D {
       canvas.style.webkitClipPath = '';
     }
   }
+  live2DRendererResolution() {
+    const width = Math.max(1, Number(el.stage?.clientWidth) || Number(window.innerWidth) || 1);
+    const height = Math.max(1, Number(el.stage?.clientHeight) || Number(window.innerHeight) || 1);
+    const dpr = Math.max(1, Number(window.devicePixelRatio) || 1);
+    const pixelBudget = Math.max(1, Number(LIVE2D_TEXTURE_COMPAT.rendererPixelBudget) || 2400000);
+    const budgetResolution = Math.sqrt(pixelBudget / Math.max(1, width * height));
+    return clamp(
+      Math.min(dpr, budgetResolution, LIVE2D_TEXTURE_COMPAT.maxRendererResolution),
+      LIVE2D_TEXTURE_COMPAT.minRendererResolution,
+      LIVE2D_TEXTURE_COMPAT.maxRendererResolution,
+    );
+  }
+
   ensurePixi() {
     this.configurePixiLive2DTextureSampling();
+    const width = Math.max(1, el.stage.clientWidth || 1);
+    const height = Math.max(1, el.stage.clientHeight || 1);
+    const resolution = this.live2DRendererResolution();
     if (this.app) {
-      this.app.renderer.resize(el.stage.clientWidth || 1, el.stage.clientHeight || 1);
+      try { this.app.renderer.resolution = resolution; } catch (_) {}
+      this.app.renderer.resize(width, height);
       return;
     }
     this.app = new PIXI.Application({
@@ -2676,15 +3134,44 @@ class NovelModelLive2D {
       backgroundAlpha: 0,
       antialias: true,
       autoDensity: true,
-      resolution: Math.min(window.devicePixelRatio || 1, 2),
+      resolution,
       preserveDrawingBuffer: true,
+      premultipliedAlpha: true,
     });
+  }
+
+  configureLive2DMaskQuality() {
+    const internal = this.model?.internalModel;
+    const renderer = internal?.renderer;
+    if (!internal || !renderer || typeof renderer.setClippingMaskBufferSize !== 'function') return;
+
+    let ids = [];
+    try { ids = Array.from(internal.getDrawableIDs?.() || []); } catch (_) {}
+    const hasMouthMask = ids.some((id) => /(?:mouth.*mask|oral|tongue)/i.test(String(id || '')));
+    if (!hasMouthMask) return;
+
+    const stagePixels = Math.max(1, (el.stage?.clientWidth || 1) * (el.stage?.clientHeight || 1));
+    const deviceMemory = Math.max(1, Number(navigator.deviceMemory) || 8);
+    const lowSpec = deviceMemory <= 4 || stagePixels < 1400000;
+    const size = lowSpec
+      ? LIVE2D_TEXTURE_COMPAT.mouthMaskBufferLow
+      : LIVE2D_TEXTURE_COMPAT.mouthMaskBufferHigh;
+
+    try {
+      const current = Number(renderer.getClippingMaskBufferSize?.()) || 256;
+      if (current !== size) renderer.setClippingMaskBufferSize(size);
+      console.info(`[Live2D mask] mouth clipping buffer ${current} -> ${size}; rendererResolution=${this.live2DRendererResolution().toFixed(2)}`);
+    } catch (error) {
+      console.warn('[Live2D mask] clipping buffer adjustment skipped', error);
+    }
   }
 
   configurePixiLive2DTextureSampling() {
     if (!window.PIXI) return;
     try {
       if (PIXI.settings && PIXI.MIPMAP_MODES) PIXI.settings.MIPMAP_TEXTURES = PIXI.MIPMAP_MODES.OFF;
+      if (PIXI.settings && PIXI.SCALE_MODES) PIXI.settings.SCALE_MODE = PIXI.SCALE_MODES.LINEAR;
+      if (PIXI.settings) PIXI.settings.ROUND_PIXELS = false;
     } catch (_) {}
   }
 
@@ -2694,8 +3181,66 @@ class NovelModelLive2D {
       if (!baseTexture) continue;
       try {
         if (window.PIXI?.MIPMAP_MODES) baseTexture.mipmap = PIXI.MIPMAP_MODES.OFF;
+        if (window.PIXI?.WRAP_MODES) baseTexture.wrapMode = PIXI.WRAP_MODES.CLAMP;
+        if (window.PIXI?.SCALE_MODES) baseTexture.scaleMode = PIXI.SCALE_MODES.LINEAR;
       } catch (_) {}
       try { baseTexture.update?.(); } catch (_) {}
+    }
+  }
+
+  configureLive2DRendererAlpha() {
+    // pixi-live2d-display's Cubism 4 renderer is authored for premultiplied
+    // alpha. Keep that contract explicit: a PMA renderer + a texture that is
+    // premultiplied exactly once. This is especially important for the very
+    // dark, low-alpha pixels around mouth/skin atlas islands.
+    try { this.model?.internalModel?.renderer?.setIsPremultipliedAlpha?.(true); } catch (_) {}
+    const alphaModes = window.PIXI?.ALPHA_MODES;
+    const unpackMode = alphaModes?.UNPACK ?? alphaModes?.PREMULTIPLY_ON_UPLOAD;
+    for (const texture of this.model?.textures || []) {
+      const baseTexture = texture?.baseTexture;
+      if (!baseTexture) continue;
+      try {
+        if (unpackMode != null) baseTexture.alphaMode = unpackMode;
+        if (window.PIXI?.WRAP_MODES) baseTexture.wrapMode = PIXI.WRAP_MODES.CLAMP;
+        if (window.PIXI?.SCALE_MODES) baseTexture.scaleMode = PIXI.SCALE_MODES.LINEAR;
+        if (window.PIXI?.MIPMAP_MODES) baseTexture.mipmap = PIXI.MIPMAP_MODES.OFF;
+      } catch (_) {}
+    }
+  }
+
+  normalizeLive2DTextureEdges() {
+    if (!LIVE2D_TEXTURE_COMPAT.alphaEdgeFix || !window.PIXI || !this.model?.textures?.length) return;
+    const replacements = [];
+    for (let index = 0; index < this.model.textures.length; index += 1) {
+      const texture = this.model.textures[index];
+      const source = texture?.baseTexture?.resource?.source;
+      if (!source) continue;
+      try {
+        const score = live2dTexturePremultiplyEdgeScore(source);
+        if (!(score >= LIVE2D_TEXTURE_COMPAT.suspectScore)) continue;
+        const canvas = createLive2DStraightAlphaCompatCanvas(source);
+        if (!canvas) continue;
+        const alphaModes = PIXI.ALPHA_MODES;
+        const alphaMode = alphaModes?.UNPACK ?? alphaModes?.PREMULTIPLY_ON_UPLOAD;
+        const options = {};
+        if (alphaMode != null) options.alphaMode = alphaMode;
+        if (PIXI.MIPMAP_MODES) options.mipmap = PIXI.MIPMAP_MODES.OFF;
+        if (PIXI.WRAP_MODES) options.wrapMode = PIXI.WRAP_MODES.CLAMP;
+        if (PIXI.SCALE_MODES) options.scaleMode = PIXI.SCALE_MODES.LINEAR;
+        const baseTexture = PIXI.BaseTexture?.from
+          ? PIXI.BaseTexture.from(canvas, options)
+          : new PIXI.BaseTexture(canvas, options);
+        const replacement = new PIXI.Texture(baseTexture);
+        replacement._dotAlphaEdgeCompat = true;
+        replacements.push({ index, replacement, score });
+      } catch (_) {
+        // Cross-origin/unsupported texture sources simply keep the original.
+      }
+    }
+    for (const item of replacements) {
+      this.model.textures[item.index] = item.replacement;
+      this.compatTextureObjects.push(item.replacement);
+      console.info(`[Live2D texture] alpha-edge compatibility texture=${item.index} score=${item.score.toFixed(3)}`);
     }
   }
 
@@ -2703,10 +3248,14 @@ class NovelModelLive2D {
     this.motionMap.clear();
     this.groupParameterIds.clear();
     this.mouthParameterIds.clear();
-    for (const motion of live2d?.motions || []) {
-      const entry = { ...motion, data: null };
-      this.motionMap.set(normalizeKey(motion.name), entry);
-      this.motionMap.set(normalizeKey(fileBase(motion.path)), entry);
+    for (const sourceMotion of live2d?.motions || []) {
+      const entry = {
+        ...sourceMotion,
+        group: resolveLive2DGroup(sourceMotion.group, sourceMotion.name || fileBase(sourceMotion.path)),
+        data: null,
+      };
+      this.motionMap.set(normalizeKey(sourceMotion.name), entry);
+      this.motionMap.set(normalizeKey(fileBase(sourceMotion.path)), entry);
     }
   }
 
@@ -2733,14 +3282,14 @@ class NovelModelLive2D {
   }
 
   registerMotionParameters(motion) {
-    const group = motion.group || motion.name || 'default';
+    const group = this.motionGroup(motion);
     if (!this.groupParameterIds.has(group)) this.groupParameterIds.set(group, new Set());
     const ids = this.groupParameterIds.get(group);
     for (const curve of motion.data?.Curves || []) {
       if (curve.Target === 'Parameter' && curve.Id) {
-        ids.add(curve.Id);
+        ids.add(String(curve.Id));
         if (this.isMouthParameterId(curve.Id) || this.isMouthEmotionGroup(group)) {
-          this.mouthParameterIds.add(curve.Id);
+          this.mouthParameterIds.add(String(curve.Id));
         }
       }
     }
@@ -2755,7 +3304,7 @@ class NovelModelLive2D {
       el.fallbackTexture.classList.remove('visible');
       this.fit();
       this.renderMosaicOverlay();
-      if (!this.parameterLayers.has('Scene')) this.startDefaultIdleMotion();
+      if (!this.hasSceneLayer()) this.startDefaultIdleMotion();
     } else {
       el.fallbackTexture.classList.toggle('visible', this.hasFallbackTexture);
     }
@@ -2776,7 +3325,7 @@ class NovelModelLive2D {
     el.mosaicLayer.classList.remove('live2d-layer-visible');
     el.fallbackTexture.classList.remove('visible');
     el.motionBadge.textContent = 'Live2D hidden';
-    this.stopLipSync();
+    this.stopLipSync(true);
     this.clearMosaicOverlay();
   }
 
@@ -2794,23 +3343,189 @@ class NovelModelLive2D {
     this.setMosaicMode(enabled ? 'original' : 'off');
   }
 
-  playMotion(name, enabled = true, idle = false) {
-    const motion = this.motionMap.get(normalizeKey(name));
-    if (!idle) {
-      this.currentMotion = name || '';
-      el.motionBadge.textContent = name || '';
+  findMotionForTrigger(name) {
+    const text = String(name || '').trim();
+    if (!text) return null;
+    const exact = this.motionMap.get(normalizeKey(text));
+    if (exact?.data) return exact;
+    if (isLive2DRuntimeResetName(text)) return null;
+
+    // Story uses logical F/N triggers while exported clips commonly insert the
+    // variant letter before the numeric suffix: MouthEmotion06 -> F06,
+    // MouthEmotion06_N -> N06.  This convention also appears in single-model
+    // stories, so it must not be treated as a multi-character special case.
+    const variant = text.match(/^(EyeOpen|EyebrowEmotion|FaceEmotion|MouthEmotion)(\d+)(?:(_N))?$/i);
+    if (variant) {
+      const family = variant[1];
+      const digits = variant[2];
+      const letter = variant[3] ? 'N' : 'F';
+      for (const candidate of [`${family}${letter}${digits}`, `${family}${digits}`]) {
+        const motion = this.motionMap.get(normalizeKey(candidate));
+        if (motion?.data) return motion;
+      }
     }
-    if (!this.model || !motion?.data) {
-      if (this.resetMotionGroup(name)) return;
-      if (!idle) pulseFallback();
+
+    // Some shipped Catalogs contain a real source typo: EyeOpne00..03.
+    // Treat it as an alias rather than declaring the Story trigger missing.
+    if (/^EyeOpen\d+(?:_N)?$/i.test(text)) {
+      const typo = text.replace(/^EyeOpen/i, 'EyeOpne');
+      const motion = this.motionMap.get(normalizeKey(typo));
+      if (motion?.data) return motion;
+    }
+
+    // Animator state aliases do not always equal the AnimationClip filename.
+    // Scene07_1 -> scene07_01 / scene07_loop_01; Scene02b_loop -> scene02_loop.
+    const sceneVariant = text.match(/^(Scene\d+)_0?1$/i);
+    if (sceneVariant) {
+      for (const candidate of [`${sceneVariant[1]}_01`, `${sceneVariant[1]}_loop_01`, `${sceneVariant[1]}_loop`]) {
+        const motion = this.motionMap.get(normalizeKey(candidate));
+        if (motion?.data) return motion;
+      }
+    }
+    const sceneB = text.match(/^(Scene\d+)b_loop$/i);
+    if (sceneB) {
+      for (const candidate of [`${sceneB[1]}_loop`, sceneB[1]]) {
+        const motion = this.motionMap.get(normalizeKey(candidate));
+        if (motion?.data) return motion;
+      }
+    }
+
+    // Scene triggers may reference the persistent loop without the _loop suffix.
+    const loop = this.motionMap.get(normalizeKey(`${text}_loop`));
+    if (loop?.data) return loop;
+
+    const eye = this.resolveEyeEmotionTrigger(text);
+    if (eye?.data) return eye;
+    return null;
+  }
+
+  resolveEyeEmotionTrigger(name) {
+    const text = String(name || '').trim();
+    const match = text.match(/^EyeEmotion(TopLeft|TopRight|BottomLeft|BottomRight|Left|Right|Top|Bottom)(?:(_N))?$/i);
+    if (!match) return null;
+    const direction = match[1].toLowerCase();
+    const wantsN = !!match[2];
+    const target = {
+      left: [1, 0], right: [-1, 0], top: [0, 1], bottom: [0, -1],
+      topleft: [0.75, 0.75], topright: [-0.75, 0.75],
+      bottomleft: [0.75, -0.75], bottomright: [-0.75, -0.75],
+    }[direction];
+    if (!target) return null;
+
+    const unique = Array.from(new Set(this.motionMap.values()))
+      .filter((motion) => /^EyeEmotion\d+$/i.test(String(motion?.name || fileBase(motion?.path) || '')) && motion?.data);
+    const rows = unique.map((motion) => ({ motion, ...this.eyeEmotionVector(motion) })).filter((row) => row.valid);
+    if (!rows.length) return null;
+    const baseRows = rows.filter((row) => row.variant === 'base');
+    const altRows = rows.filter((row) => row.variant !== 'base');
+    let candidates = rows;
+    if (wantsN && altRows.length) candidates = altRows;
+    else if (!wantsN && baseRows.length) candidates = baseRows;
+    let best = null;
+    let bestScore = Infinity;
+    for (const row of candidates) {
+      const score = (row.x - target[0]) ** 2 + (row.y - target[1]) ** 2;
+      if (score < bestScore) { bestScore = score; best = row.motion; }
+    }
+    return best;
+  }
+
+  eyeEmotionVector(motion) {
+    const duration = Math.max(0.001, Number(motion?.data?.Meta?.Duration ?? motion?.duration ?? 0.5));
+    let x = null;
+    let y = null;
+    let xId = '';
+    let yId = '';
+    for (const curve of motion?.data?.Curves || []) {
+      if (curve?.Target !== 'Parameter' || !curve.Id) continue;
+      const id = String(curve.Id);
+      if (/^ParamEyeBallX\d*$/i.test(id)) {
+        const value = evaluateMotionCurve(curve.Segments, duration);
+        if (Number.isFinite(Number(value))) { x = Number(value); xId = id; }
+      } else if (/^ParamEyeBallY\d*$/i.test(id)) {
+        const value = evaluateMotionCurve(curve.Segments, duration);
+        if (Number.isFinite(Number(value))) { y = Number(value); yId = id; }
+      }
+    }
+    if (x == null && y == null) return { valid: false, x: 0, y: 0, variant: 'unknown' };
+    const numbered = /\d+$/.test(xId.replace(/^ParamEyeBallX/i, '')) || /\d+$/.test(yId.replace(/^ParamEyeBallY/i, ''));
+    return { valid: true, x: Number(x || 0), y: Number(y || 0), variant: numbered ? 'alternate' : 'base' };
+  }
+
+  motionGroup(motionOrName) {
+    if (motionOrName && typeof motionOrName === 'object') {
+      return resolveLive2DGroup(motionOrName.group, motionOrName.name || fileBase(motionOrName.path));
+    }
+    const text = String(motionOrName || '');
+    const motion = this.findMotionForTrigger(text);
+    return resolveLive2DGroup(motion?.group, motion?.name || stripLive2DResetSuffix(text));
+  }
+
+  hasSceneLayer() {
+    return Array.from(this.parameterLayers.keys()).some((group) => this.isSceneGroup(group));
+  }
+
+  playMotion(name, enabled = true, idle = false, options = {}) {
+    const motion = this.findMotionForTrigger(name);
+    const replaying = !!options.replaying;
+    const replayTarget = !!options.replayTarget;
+
+    if (!enabled) {
+      const group = motion ? this.motionGroup(motion) : this.motionGroup(stripLive2DResetSuffix(name));
+      if (group) this.fadeMotionGroupToBase(group, replaying ? 0 : null);
+      if (!idle) {
+        this.currentMotion = '';
+        this.updateMotionBadge();
+      }
       return;
     }
-    this.startParameterMotion(motion);
+
+    if (!idle) this.currentMotion = name || '';
+
+    if (!this.model || !motion?.data) {
+      if (this.resetMotionGroup(name, replaying ? 0 : null)) {
+        if (!idle) this.currentMotion = '';
+        this.updateMotionBadge();
+        return;
+      }
+      if (!idle) {
+        el.motionBadge.textContent = name || '';
+        pulseFallback();
+      }
+      return;
+    }
+
+    const loop = Boolean(motion.data?.Meta?.Loop || motion.loop);
+    this.startParameterMotion(motion, {
+      settle: replaying && !replayTarget && !loop,
+      restart: !!options.restart,
+    });
+    this.updateMotionBadge();
+  }
+
+  updateMotionBadge() {
+    if (!el.motionBadge) return;
+    const active = Array.from(this.activeMotionByGroup.entries())
+      .sort(([left], [right]) => live2dGroupPriority(left) - live2dGroupPriority(right))
+      .map(([group, state]) => `${group}:${state.motion?.name || fileBase(state.motion?.path) || ''}`)
+      .filter(Boolean);
+    el.motionBadge.textContent = active.length ? active.join(' + ') : (this.currentMotion || '');
+  }
+
+  activeMotionSummary() {
+    return Array.from(this.activeMotionByGroup.entries())
+      .sort(([left], [right]) => live2dGroupPriority(left) - live2dGroupPriority(right))
+      .map(([group, state]) => ({
+        group,
+        motion: state.motion?.name || fileBase(state.motion?.path) || '',
+        loop: !!state.loop,
+        elapsed: Math.max(0, (performance.now() - Number(state.startedAt || performance.now())) / 1000),
+      }));
   }
 
   isSceneMotionName(name) {
-    const motion = this.motionMap.get(normalizeKey(name));
-    return String(motion?.group || name || '').toLowerCase().startsWith('scene');
+    const motion = this.findMotionForTrigger(name);
+    return this.isSceneGroup(this.motionGroup(motion || name));
   }
 
   startDefaultIdleMotion() {
@@ -2823,14 +3538,13 @@ class NovelModelLive2D {
   findDefaultIdleMotion() {
     const motions = Array.from(new Set(this.motionMap.values()));
     return this.motionMap.get(normalizeKey(L2D_DEFAULT_IDLE_MOTION))
-      || motions.find((motion) => motion.group === 'Idle')
-      || motions.find((motion) => motion.group === 'Scene' && /_loop$/i.test(motion.name || ''))
+      || motions.find((motion) => normalizeKey(motion.group) === 'idle')
+      || motions.find((motion) => this.isSceneGroup(this.motionGroup(motion)) && /_loop$/i.test(motion.name || ''))
       || null;
   }
 
   isSceneGroup(group) {
-    const key = normalizeKey(group || '');
-    return key === 'scene' || key.startsWith('scene');
+    return resolveLive2DGroup(group, group) === 'Scene';
   }
 
   ensureMotionReferenceLayer(group) {
@@ -2845,109 +3559,172 @@ class NovelModelLive2D {
     return Number.isFinite(Number(fallback)) ? Number(fallback) : 0;
   }
 
-  startParameterMotion(motion) {
-    const group = motion.group || motion.name || 'default';
+  ensurePartOpacityLayer(group) {
+    if (!this.partOpacityLayers.has(group)) this.partOpacityLayers.set(group, new Map());
+    return this.partOpacityLayers.get(group);
+  }
+
+  ensureModelEffectLayer(group) {
+    if (!this.modelEffectLayers.has(group)) this.modelEffectLayers.set(group, new Map());
+    return this.modelEffectLayers.get(group);
+  }
+
+  startParameterMotion(motion, options = {}) {
+    const group = this.motionGroup(motion);
+    const loop = Boolean(motion.data?.Meta?.Loop || motion.loop);
+    const currentState = this.activeMotionByGroup.get(group);
+    if (!options.restart && loop && currentState?.motion === motion && currentState.loop) return;
+
     const generation = (this.motionGeneration.get(group) || 0) + 1;
     this.motionGeneration.set(group, generation);
     const layer = this.ensureParameterLayer(group);
+    const partLayer = this.ensurePartOpacityLayer(group);
+    const effectLayer = this.ensureModelEffectLayer(group);
 
     const duration = Math.max(0.001, Number(motion.data?.Meta?.Duration ?? motion.duration ?? 0.5));
-    const loop = Boolean(motion.data?.Meta?.Loop || motion.loop);
     const previousMotion = this.lastMotionByGroup.get(group);
     const previousValues = new Map(layer);
-    const previousIds = new Set(previousValues.keys());
+    const previousPartValues = new Map(partLayer);
+    const previousEffectValues = new Map(effectLayer);
 
-    // Preserve authored Cubism fade values, but guarantee a tiny hand-off window
-    // when one motion directly replaces another with no explicit fade time. This
-    // prevents a one-frame discontinuity without introducing a visible pause.
     const authoredFadeIn = Math.max(0, Number(motion.fadeInTime ?? motion.data?.Meta?.FadeInTime ?? 0));
     const authoredFadeOut = Math.max(0, Number(previousMotion?.fadeOutTime ?? previousMotion?.data?.Meta?.FadeOutTime ?? 0));
-    const hasDirectHandoff = Boolean(previousMotion && previousMotion !== motion && previousValues.size);
+    const hasDirectHandoff = Boolean(previousMotion && previousMotion !== motion && (
+      previousValues.size || previousPartValues.size || previousEffectValues.size
+    ));
     const HANDOFF_IN = 0.08;
     const HANDOFF_OUT = 0.08;
     const fadeIn = authoredFadeIn > 0 ? authoredFadeIn : (hasDirectHandoff ? HANDOFF_IN : 0);
     const fadeOut = authoredFadeOut > 0 ? authoredFadeOut : (hasDirectHandoff ? HANDOFF_OUT : 0);
 
-    // Motion3 Parameter curves are authored as absolute parameter values.
-    // Scene is the absolute base. Non-Scene motions contribute only their
-    // offset from the Live2D parameter default, never their own t=0 sample.
-    const curves = (motion.data?.Curves || [])
+    const parameterCurves = (motion.data?.Curves || [])
       .filter((curve) => curve?.Target === 'Parameter' && curve?.Id && Array.isArray(curve.Segments))
       .map((curve) => ({ id: String(curve.Id), curve }));
-    const curveMap = new Map(curves.map((entry) => [entry.id, entry]));
-    const curveIds = new Set(curveMap.keys());
+    const partCurves = (motion.data?.Curves || [])
+      .filter((curve) => curve?.Target === 'PartOpacity' && curve?.Id && Array.isArray(curve.Segments))
+      .map((curve) => ({ id: String(curve.Id), curve }));
+    const modelCurves = (motion.data?.Curves || [])
+      .filter((curve) => curve?.Target === 'Model' && curve?.Id && Array.isArray(curve.Segments))
+      .map((curve) => ({ id: normalizeLive2DModelCurveId(curve.Id), curve }))
+      .filter((entry) => entry.id);
+
+    const parameterMap = new Map(parameterCurves.map((entry) => [entry.id, entry]));
+    const partMap = new Map(partCurves.map((entry) => [entry.id, entry]));
+    for (const id of partMap.keys()) this.rememberPartOpacityDefault(id);
+    const effectMap = new Map(modelCurves.map((entry) => [entry.id, entry]));
     const sceneGroup = this.isSceneGroup(group);
-    const deltaReferences = new Map();
-    if (!sceneGroup) {
-      for (const id of curveIds) {
+    // MouthEmotion clips are exported as complete mouth states, not additive
+    // corrections.  A clip explicitly writes zero to the selectors it wants
+    // disabled (ParamMouthFxx / ParamMouthNxx) and sometimes to MouthOpenY.
+    // Treating those zeroes as deltas leaves the Scene mouth selectors active
+    // underneath, which can combine several mouth meshes and expose dark oral
+    // textures / masks.  Keep the old additive semantics for the other facial
+    // groups, but make MouthEmotion an absolute override layer.
+    const absoluteOverrideGroup = this.isAbsoluteOverrideGroup(group);
+    const defaultReferences = new Map();
+    if (!sceneGroup && !absoluteOverrideGroup) {
+      for (const id of parameterMap.keys()) {
         const reference = this.defaultParameterValue(id);
-        deltaReferences.set(id, Number.isFinite(Number(reference)) ? Number(reference) : 0);
+        defaultReferences.set(id, Number.isFinite(Number(reference)) ? Number(reference) : 0);
       }
     }
 
     const fadeFrom = new Map();
-    for (const id of curveIds) {
-      if (previousValues.has(id)) {
-        fadeFrom.set(id, previousValues.get(id));
-      } else {
-        fadeFrom.set(id, sceneGroup ? this.composedParameterValue(id, { skipGroup: group }) : 0);
-      }
+    for (const id of parameterMap.keys()) {
+      let fallback = 0;
+      if (sceneGroup) fallback = this.composedSceneBaseValue(id, { skipGroup: group });
+      else if (absoluteOverrideGroup) fallback = this.composedParameterValue(id, { skipGroup: group });
+      fadeFrom.set(id, previousValues.has(id) ? previousValues.get(id) : fallback);
+    }
+    const partFadeFrom = new Map();
+    for (const id of partMap.keys()) {
+      partFadeFrom.set(id, previousPartValues.has(id)
+        ? previousPartValues.get(id)
+        : this.composedPartOpacity(id, { skipGroup: group }));
+    }
+    const effectFadeFrom = new Map();
+    for (const id of effectMap.keys()) {
+      effectFadeFrom.set(id, previousEffectValues.has(id)
+        ? previousEffectValues.get(id)
+        : live2dModelCurveDefault(id));
     }
 
-    const releaseIds = new Set();
-    for (const id of previousIds) {
-      if (!curveIds.has(id)) releaseIds.add(id);
-    }
+    const releaseIds = new Set([...previousValues.keys()].filter((id) => !parameterMap.has(id)));
+    const releasePartIds = new Set([...previousPartValues.keys()].filter((id) => !partMap.has(id)));
+    const releaseEffectIds = new Set([...previousEffectValues.keys()].filter((id) => !effectMap.has(id)));
 
-    const started = performance.now();
+    const settle = !!options.settle && !loop;
+    const started = performance.now() - (settle ? Math.max(duration, fadeOut) * 1000 : 0);
     this.lastMotionByGroup.set(group, motion);
+    this.activeMotionByGroup.set(group, { motion, generation, loop, startedAt: performance.now() });
 
     const tick = () => {
       if (!this.model || this.motionGeneration.get(group) !== generation) return;
 
-      const elapsed = (performance.now() - started) / 1000;
+      const elapsed = settle ? Math.max(duration, fadeOut) : (performance.now() - started) / 1000;
       const time = loop ? elapsed % duration : Math.min(elapsed, duration);
       const effectiveFadeIn = Math.min(fadeIn, Math.max(0, duration * 0.35));
-      const fadeWeight = effectiveFadeIn > 0 ? smoothStep(clamp(elapsed / effectiveFadeIn, 0, 1)) : 1;
-      const releaseWeight = fadeOut > 0
-        ? smoothStep(clamp(elapsed / fadeOut, 0, 1))
-        : 1;
+      const fadeWeight = settle ? 1 : (effectiveFadeIn > 0 ? smoothStep(clamp(elapsed / effectiveFadeIn, 0, 1)) : 1);
+      const releaseWeight = settle ? 1 : (fadeOut > 0 ? smoothStep(clamp(elapsed / fadeOut, 0, 1)) : 1);
 
-      // During a direct replacement, evaluate the new curve from its true time
-      // origin while continuously releasing only parameters that disappeared
-      // from the new motion. This keeps shared parameters glued to the current
-      // visual state instead of creating a temporary zero/default dip.
-
-      for (const { id, curve } of curveMap.values()) {
+      for (const { id, curve } of parameterMap.values()) {
         const value = evaluateMotionCurve(curve.Segments, time);
         if (value == null) continue;
-        let targetValue = Number(value);
-        if (!sceneGroup) {
-          targetValue -= deltaReferences.get(id) ?? 0;
-        }
+        const authored = Number(value);
+        const targetValue = (sceneGroup || absoluteOverrideGroup)
+          ? authored
+          : authored - (defaultReferences.get(id) ?? 0);
         const from = fadeFrom.get(id);
-        layer.set(id, from == null ? targetValue : lerp(from, targetValue, fadeWeight));
+        // The exported model itself cross-fades mouth selector parameters in
+        // Scene motions, and some MouthEmotion clips intentionally enable two
+        // selectors at once. Preserve that authored interpolation; the bug was
+        // additive composition with Scene, not interpolation inside the clip.
+        layer.set(id, from == null ? targetValue : lerp(Number(from), targetValue, fadeWeight));
       }
 
-      // Parameters no longer present in the replacement Motion must release
-      // to the lower composition. Story/Expression deltas release to zero;
-      // Scene releases toward the current lower composition.
       for (const id of releaseIds) {
-        const from = previousValues.get(id);
+        const from = Number(previousValues.get(id));
         const target = sceneGroup
-          ? this.composedParameterValue(id, { skipGroup: group })
-          : 0;
-        if (from == null || target == null) {
-          layer.delete(id);
-        } else {
-          layer.set(id, lerp(from, target, releaseWeight));
-        }
+          ? this.composedSceneBaseValue(id, { skipGroup: group })
+          : (absoluteOverrideGroup ? this.composedParameterValue(id, { skipGroup: group }) : 0);
+        if (!Number.isFinite(from) || target == null || !Number.isFinite(Number(target))) layer.delete(id);
+        else layer.set(id, lerp(from, Number(target), releaseWeight));
         if (releaseWeight >= 1) layer.delete(id);
       }
 
-      this.applyHeldParameters();
+      for (const { id, curve } of partMap.values()) {
+        const value = evaluateMotionCurve(curve.Segments, time);
+        if (value == null) continue;
+        const from = Number(partFadeFrom.get(id));
+        const targetValue = clamp(Number(value), 0, 1);
+        partLayer.set(id, Number.isFinite(from) ? lerp(from, targetValue, fadeWeight) : targetValue);
+      }
+      for (const id of releasePartIds) {
+        const from = Number(previousPartValues.get(id));
+        const target = this.composedPartOpacity(id, { skipGroup: group });
+        partLayer.set(id, lerp(Number.isFinite(from) ? from : target, target, releaseWeight));
+        if (releaseWeight >= 1) partLayer.delete(id);
+      }
 
-      const releaseStillRunning = releaseIds.size > 0 && releaseWeight < 1;
+      for (const { id, curve } of effectMap.values()) {
+        const value = evaluateMotionCurve(curve.Segments, time);
+        if (value == null) continue;
+        const from = Number(effectFadeFrom.get(id));
+        const targetValue = Number(value);
+        effectLayer.set(id, Number.isFinite(from) ? lerp(from, targetValue, fadeWeight) : targetValue);
+      }
+      for (const id of releaseEffectIds) {
+        const from = Number(previousEffectValues.get(id));
+        const target = live2dModelCurveDefault(id);
+        effectLayer.set(id, lerp(Number.isFinite(from) ? from : target, target, releaseWeight));
+        if (releaseWeight >= 1) effectLayer.delete(id);
+      }
+
+      this.applyHeldParameters();
+      this.applyHeldPartOpacities();
+      this.applyHeldModelOpacity();
+
+      const releaseStillRunning = (releaseIds.size || releasePartIds.size || releaseEffectIds.size) && releaseWeight < 1;
       if (loop || elapsed < duration || releaseStillRunning) {
         requestAnimationFrame(tick);
       } else {
@@ -2959,14 +3736,15 @@ class NovelModelLive2D {
   }
 
   startCompanionSceneLoop(motion, generation) {
-    const group = motion.group || motion.name || 'default';
-    const sceneLike = String(group).toLowerCase().startsWith('scene')
-      || String(motion.name || '').toLowerCase().startsWith('scene');
-    if (!sceneLike || this.motionGeneration.get(group) !== generation) return;
+    const group = this.motionGroup(motion);
+    if (!this.isSceneGroup(group) || this.motionGeneration.get(group) !== generation) return;
     const baseName = motion.name || fileBase(motion.path);
     if (!baseName || /_loop$/i.test(baseName)) return;
     const loopMotion = this.motionMap.get(normalizeKey(`${baseName}_loop`));
-    if (loopMotion?.data && loopMotion !== motion) this.startParameterMotion(loopMotion);
+    if (loopMotion?.data && loopMotion !== motion) {
+      this.startParameterMotion(loopMotion);
+      this.updateMotionBadge();
+    }
   }
 
   resetStaleMotionParameters(group, nextMotion) {
@@ -3054,6 +3832,8 @@ class NovelModelLive2D {
       }
       this.updateLipSync();
       this.applyHeldParameters();
+      this.applyHeldPartOpacities();
+      this.applyHeldModelOpacity();
       this.renderMosaicOverlay();
       this.holdFrame = requestAnimationFrame(tick);
     };
@@ -3070,6 +3850,8 @@ class NovelModelLive2D {
     this.live2dUpdateHandler = () => {
       this.updateLipSync();
       this.applyHeldParameters();
+      this.applyHeldPartOpacities();
+      this.applyHeldModelOpacity();
     };
     internal.on('afterMotionUpdate', this.live2dMotionUpdateHandler);
     internal.on('beforeModelUpdate', this.live2dUpdateHandler);
@@ -3298,71 +4080,231 @@ class NovelModelLive2D {
 
   applyHeldParameters() {
     this.heldParameters.clear();
-    const groups = Array.from(this.parameterLayers.keys()).sort((left, right) => {
-      const diff = live2dGroupPriority(left) - live2dGroupPriority(right);
-      return diff || String(left).localeCompare(String(right));
-    });
+    const groups = this.sortedMotionGroups(this.parameterLayers.keys());
 
-    // Scene is the absolute/base layer. All ordinary Story expression/pose
-    // motions are deltas and are added to the live Scene value. LipSync is an
-    // effect and is therefore excluded from the ordinary delta accumulator.
-    const accumulatedDeltas = new Map();
+    // Scene/Idle is the absolute base. Other animation groups are authored as
+    // offsets from their parameter defaults, so several independent groups can
+    // play at the same time without flattening the underlying body motion.
     for (const group of groups) {
-      if (group === 'Scene' || group === L2D_LIP_SYNC.layer) continue;
+      if (!this.isSceneGroup(group)) continue;
       const layer = this.parameterLayers.get(group);
       if (!layer) continue;
       for (const [id, value] of layer.entries()) {
-        const n = Number(value);
-        if (!Number.isFinite(n)) continue;
-        accumulatedDeltas.set(id, (accumulatedDeltas.get(id) || 0) + n);
-      }
-    }
-
-    const sceneLayer = this.parameterLayers.get('Scene');
-    if (sceneLayer) {
-      for (const [id, value] of sceneLayer.entries()) {
         const n = Number(value);
         if (Number.isFinite(n)) this.heldParameters.set(id, n);
       }
     }
 
-    const lip = this.lipSync;
-    const lipActive = !!(lip?.useMultiCharacterLipSync && lip.parameterId && Number.isFinite(Number(lip.mouseY)));
-    const lipTargetId = lipActive ? String(lip.parameterId) : '';
-
-    for (const [id, rawDelta] of accumulatedDeltas.entries()) {
-      // When LipSync is active, its target mouth-opening parameter is fully
-      // owned by LipSync for this frame. Do not compose MouthEmotion/Scene
-      // values into the same parameter and then add audio on top.
-      if (lipActive && String(id) === lipTargetId) continue;
-      const sceneValue = sceneLayer?.has(id) ? Number(sceneLayer.get(id)) : this.defaultParameterValue(id);
-      if (sceneValue == null || !Number.isFinite(Number(sceneValue))) continue;
-      this.heldParameters.set(id, Number(sceneValue) + Number(rawDelta));
-    }
-
-    // EyeBlink is a Multiply effect. It never overwrites the Story expression
-    // state; it simply closes the currently composed eye by a deterministic
-    // factor while the Scene-authored blink curve is active.
-    const blink = this.sceneEffects?.eyeBlink;
-    if (blink && Number.isFinite(Number(blink.value))) {
-      const factor = clamp(Number(blink.value), 0, 1);
-      for (const id of this.effectParameterIds('eyeBlink')) {
+    for (const group of groups) {
+      if (this.isSceneGroup(group) || group === L2D_LIP_SYNC.layer) continue;
+      const layer = this.parameterLayers.get(group);
+      if (!layer) continue;
+      const absoluteOverrideGroup = this.isAbsoluteOverrideGroup(group);
+      for (const [id, value] of layer.entries()) {
+        const n = Number(value);
+        if (!Number.isFinite(n)) continue;
+        if (absoluteOverrideGroup) {
+          this.heldParameters.set(id, n);
+          continue;
+        }
         const base = this.heldParameters.has(id)
           ? Number(this.heldParameters.get(id))
-          : this.defaultParameterValue(id);
-        if (Number.isFinite(Number(base))) this.heldParameters.set(id, Number(base) * factor);
+          : Number(this.defaultParameterValue(id));
+        if (Number.isFinite(base)) this.heldParameters.set(id, base + n);
       }
     }
 
-    // LipSync is a final absolute controller for its mouth-opening target.
-    // It does not participate in Scene/Story composition and does not add on
-    // top of a scripted mouth-open value. The audio-derived value is written
-    // directly as the final value for this target parameter.
-    if (lipActive) {
-      this.heldParameters.set(lipTargetId, Number(lip.mouseY));
+    // motion3 Model curves are evaluated after Parameter curves, matching the
+    // Cubism runtime: EyeBlink multiplies eye-open parameters and LipSync adds
+    // to mouth-open parameters. A parameter curve in the same group wins over
+    // the group's Model effect for that parameter.
+    const effectGroups = this.sortedMotionGroups(this.modelEffectLayers.keys());
+    const voiceLip = this.lipSync;
+    const voiceLipActive = !!(voiceLip?.useMultiCharacterLipSync && voiceLip.parameterId && Number.isFinite(Number(voiceLip.mouseY)));
+    const voiceLipTargetId = voiceLipActive ? String(voiceLip.parameterId) : '';
+
+    for (const group of effectGroups) {
+      const effects = this.modelEffectLayers.get(group);
+      if (!effects) continue;
+      const parameterLayer = this.parameterLayers.get(group);
+
+      if (effects.has('eyeBlink')) {
+        const factor = clamp(Number(effects.get('eyeBlink')), 0, 1);
+        if (Number.isFinite(factor)) {
+          for (const id of this.effectParameterIds('eyeBlink')) {
+            if (parameterLayer?.has(id)) continue;
+            const base = this.heldParameters.has(id)
+              ? Number(this.heldParameters.get(id))
+              : Number(this.defaultParameterValue(id));
+            if (Number.isFinite(base)) this.heldParameters.set(id, base * factor);
+          }
+        }
+      }
+
+      if (effects.has('lipSync') && !voiceLipActive) {
+        const addition = Number(effects.get('lipSync'));
+        if (Number.isFinite(addition)) {
+          for (const id of this.effectParameterIds('lipSync')) {
+            if (parameterLayer?.has(id)) continue;
+            const base = this.heldParameters.has(id)
+              ? Number(this.heldParameters.get(id))
+              : Number(this.defaultParameterValue(id));
+            if (Number.isFinite(base)) this.heldParameters.set(id, base + addition);
+          }
+        }
+      }
     }
 
-    for (const [id, value] of this.heldParameters.entries()) this.setParameter(id, value);
+    // Voice LipSync stays above scripted mouth motion, but it now uses the
+    // remaining mouth-open headroom instead of blindly adding 0..1. This keeps
+    // MouthEmotion (smile/grimace/closed-mouth poses) visible and avoids the
+    // frequent hard clamp at ParamMouthOpenY max.
+    if (voiceLipActive) {
+      const base = this.heldParameters.has(voiceLipTargetId)
+        ? Number(this.heldParameters.get(voiceLipTargetId))
+        : Number(this.defaultParameterValue(voiceLipTargetId));
+      const opening = Number(voiceLip.mouseY);
+      if (Number.isFinite(base) && Number.isFinite(opening)) {
+        this.heldParameters.set(
+          voiceLipTargetId,
+          this.composeVoiceLipSyncValue(voiceLipTargetId, base, opening),
+        );
+      }
+      const formId = String(voiceLip.formParameterId || '');
+      if (formId && this.actualParameterExists(formId)) {
+        const formBase = this.heldParameters.has(formId)
+          ? Number(this.heldParameters.get(formId))
+          : Number(this.defaultParameterValue(formId));
+        if (Number.isFinite(formBase)) {
+          this.heldParameters.set(formId, this.composeVoiceLipFormValue(formId, formBase, voiceLip.formY));
+        }
+      }
+    }
+
+    // Parameters that were controlled on the previous frame but are no longer
+    // owned by any live layer must be restored. Without this, a completed/reset
+    // action can leave a stale pose stuck in the Core model indefinitely.
+    for (const id of this.appliedParameterIds) {
+      if (this.heldParameters.has(id)) continue;
+      const fallback = this.defaultParameterValue(id);
+      if (fallback != null && Number.isFinite(Number(fallback))) this.setParameter(id, Number(fallback));
+    }
+
+    const nextApplied = new Set();
+    for (const [id, value] of this.heldParameters.entries()) {
+      this.setParameter(id, value);
+      nextApplied.add(id);
+    }
+    this.appliedParameterIds = nextApplied;
+  }
+
+  sortedMotionGroups(groups) {
+    return Array.from(groups).sort((left, right) => {
+      const diff = live2dGroupPriority(left) - live2dGroupPriority(right);
+      return diff || String(left).localeCompare(String(right));
+    });
+  }
+
+  effectParameterIds(kind) {
+    const manager = this.model?.internalModel?.motionManager;
+    const raw = kind === 'eyeBlink' ? manager?.eyeBlinkIds : manager?.lipSyncIds;
+    const fromManager = live2dIdArray(raw).filter((id) => this.actualParameterExists(id));
+    if (fromManager.length) return fromManager;
+    const ids = this.actualParameterIds();
+    if (kind === 'eyeBlink') return ids.filter((id) => /ParamEye.*Open/i.test(id));
+    return ids.filter((id) => /^ParamMouthOpenY\d*$/i.test(id));
+  }
+
+  composedPartOpacity(id, options = {}) {
+    const skipGroup = options.skipGroup || '';
+    let value = this.defaultPartOpacityValue(id);
+    for (const group of this.sortedMotionGroups(this.partOpacityLayers.keys())) {
+      if (group === skipGroup) continue;
+      const layer = this.partOpacityLayers.get(group);
+      if (layer?.has(id)) value = clamp(Number(layer.get(id)), 0, 1);
+    }
+    return Number.isFinite(value) ? value : 1;
+  }
+
+  rememberPartOpacityDefault(id) {
+    if (!id || this.partOpacityDefaults.has(id)) return;
+    const current = this.currentPartOpacity(id);
+    this.partOpacityDefaults.set(id, Number.isFinite(Number(current)) ? Number(current) : 1);
+  }
+
+  defaultPartOpacityValue(id) {
+    if (this.partOpacityDefaults.has(id)) return Number(this.partOpacityDefaults.get(id));
+    this.rememberPartOpacityDefault(id);
+    return this.partOpacityDefaults.has(id) ? Number(this.partOpacityDefaults.get(id)) : 1;
+  }
+
+  currentPartOpacity(id) {
+    const core = this.model?.internalModel?.coreModel;
+    if (!core || !id) return 1;
+    try {
+      if (typeof core.getPartOpacityById === 'function') return core.getPartOpacityById(id);
+    } catch (_) {}
+    try {
+      const model = core._model || core.getModel?.();
+      const ids = model?.parts?.ids || core._partIds || [];
+      const opacities = model?.parts?.opacities;
+      const index = Array.from(ids, live2dIdString).indexOf(String(id));
+      if (opacities && index >= 0 && index < opacities.length) return Number(opacities[index]);
+    } catch (_) {}
+    return 1;
+  }
+
+  applyHeldPartOpacities() {
+    const composed = new Map();
+    for (const group of this.sortedMotionGroups(this.partOpacityLayers.keys())) {
+      const layer = this.partOpacityLayers.get(group);
+      if (!layer) continue;
+      for (const [id, value] of layer.entries()) {
+        const n = Number(value);
+        if (Number.isFinite(n)) composed.set(id, clamp(n, 0, 1));
+      }
+    }
+    for (const id of this.appliedPartOpacityIds) {
+      if (!composed.has(id)) this.setPartOpacity(id, this.defaultPartOpacityValue(id));
+    }
+    for (const [id, value] of composed.entries()) this.setPartOpacity(id, value);
+    this.appliedPartOpacityIds = new Set(composed.keys());
+  }
+
+  setPartOpacity(id, value) {
+    const core = this.model?.internalModel?.coreModel;
+    const opacity = clamp(Number(value), 0, 1);
+    if (!core || !Number.isFinite(opacity)) return;
+    try {
+      if (typeof core.setPartOpacityById === 'function') {
+        core.setPartOpacityById(id, opacity);
+        return;
+      }
+    } catch (_) {}
+    try {
+      const model = core._model || core.getModel?.();
+      const ids = model?.parts?.ids || core._partIds || [];
+      const opacities = model?.parts?.opacities;
+      const index = Array.from(ids, live2dIdString).indexOf(String(id));
+      if (opacities && index >= 0 && index < opacities.length) opacities[index] = opacity;
+    } catch (_) {}
+  }
+
+  applyHeldModelOpacity() {
+    if (!this.model) return;
+    let opacity = 1;
+    for (const group of this.sortedMotionGroups(this.modelEffectLayers.keys())) {
+      const layer = this.modelEffectLayers.get(group);
+      if (layer?.has('opacity')) opacity = clamp(Number(layer.get('opacity')), 0, 1);
+    }
+    if (!Number.isFinite(opacity)) opacity = 1;
+    try {
+      const core = this.model.internalModel?.coreModel;
+      if (typeof core?.setModelOpacity === 'function') core.setModelOpacity(opacity);
+      else this.model.alpha = opacity;
+    } catch (_) {
+      this.model.alpha = opacity;
+    }
   }
 
   setParameter(id, value) {
@@ -3390,11 +4332,25 @@ class NovelModelLive2D {
     return normalizeKey(group).startsWith('mouthemotion');
   }
 
+  isAbsoluteOverrideGroup(group) {
+    // Keep the previously preferred additive composition for face/eye layers,
+    // but MouthEmotion is authored as a complete state and must replace the
+    // Scene values for every parameter it explicitly controls.
+    return this.isMouthEmotionGroup(group);
+  }
+
   isMouthParameterId(id) {
     const text = String(id || '');
     return /^ParamMouth/i.test(text)
       || /^Paramtongue$/i.test(text)
       || this.mouthParameterIds.has(text);
+  }
+
+  isDiscreteMouthShapeParameter(id) {
+    const text = String(id || '');
+    return /^ParamMouth(?:F|N)\d+$/i.test(text)
+      || /^ParamMouthShape\d+$/i.test(text)
+      || /^ParamMouthType\d+$/i.test(text);
   }
 
   hasParameter(id) {
@@ -3414,10 +4370,10 @@ class NovelModelLive2D {
     ];
     for (const source of candidates) {
       if (!source) continue;
-      if (Array.isArray(source)) return source.map(String);
-      if (source instanceof Set) return Array.from(source, String);
+      if (Array.isArray(source)) return source.map(live2dIdString).filter(Boolean);
+      if (source instanceof Set) return Array.from(source, live2dIdString).filter(Boolean);
       if (typeof source.length === 'number') {
-        try { return Array.from(source, String); } catch (_) {}
+        try { return Array.from(source, live2dIdString).filter(Boolean); } catch (_) {}
       }
     }
     return [];
@@ -3431,8 +4387,16 @@ class NovelModelLive2D {
     return this.mouthParameterIds.has(String(id));
   }
 
-  resolveLipSyncParameterId(suffix) {
+  resolveLipSyncParameterId(suffix, mode = 'multi') {
     const clean = String(suffix || '').trim();
+    const key = normalizeKey(mode || 'multi');
+    if (key === 'off' || key === 'none' || key === 'false' || key === '0') return '';
+    // Single/default mode uses the ordinary Cubism mouth parameter when the
+    // model exports one. Multi mode keeps the character-suffixed parameters.
+    if (key === 'single' || key === 'normal' || key === 'default') {
+      if (this.actualParameterExists(L2D_LIP_SYNC.mouthParameterPrefix)) return L2D_LIP_SYNC.mouthParameterPrefix;
+      return clean ? this.resolveExportedLipSyncParameterId(clean) : '';
+    }
     if (!clean) return '';
     const parameterId = `${L2D_LIP_SYNC.mouthParameterPrefix}${clean}`;
     if (this.actualParameterExists(parameterId)) return parameterId;
@@ -3450,33 +4414,74 @@ class NovelModelLive2D {
     return '';
   }
 
+  resolveLipSyncFormParameterId(openParameterId, suffix = '') {
+    // Only continuous mouth-form parameters are eligible. The game's
+    // ParamMouthFxx / ParamMouthNxx values select authored mouth meshes and
+    // must remain exclusively controlled by MouthEmotion/Scene motions.
+    const openId = String(openParameterId || '');
+    const cleanSuffix = String(suffix || '').trim();
+    const candidates = [];
+    if (openId === L2D_LIP_SYNC.mouthParameterPrefix) candidates.push('ParamMouthForm');
+    if (cleanSuffix) candidates.push(`ParamMouthForm${cleanSuffix}`);
+    if (!cleanSuffix || cleanSuffix === '1') candidates.push('ParamMouthForm');
+    for (const id of candidates) {
+      if (!/^ParamMouthForm\d*$/i.test(id)) continue;
+      if (this.actualParameterExists(id)) return id;
+    }
+    return '';
+  }
+
+  composeVoiceLipFormValue(id, base, formAmount) {
+    const runtime = this.parameterRange(id);
+    if (!runtime) return this.clampParameterValue(id, Number(base));
+    const authored = this.authoredParameterRange(id);
+    const min = authored ? Math.max(runtime.min, Number(authored.min)) : runtime.min;
+    const max = authored ? Math.min(runtime.max, Number(authored.max)) : runtime.max;
+    if (!(max > min)) return this.clampParameterValue(id, Number(base));
+    const center = clamp(Number(base), min, max);
+    const signed = clamp(Number(formAmount) || 0, -1, 1);
+    const room = signed >= 0 ? Math.max(0, max - center) : Math.max(0, center - min);
+    const influence = clamp(Number(this.lipSync?.weight ?? 1), 0, 1);
+    return clamp(center + signed * room * L2D_LIP_SYNC.formDrive * influence, min, max);
+  }
+
+  composedSceneBaseValue(id, options = {}) {
+    const skipGroup = options.skipGroup || '';
+    let value = this.defaultParameterValue(id);
+    if (!Number.isFinite(Number(value))) value = 0;
+    for (const group of this.sortedMotionGroups(this.parameterLayers.keys())) {
+      if (group === skipGroup || !this.isSceneGroup(group)) continue;
+      const layer = this.parameterLayers.get(group);
+      if (layer?.has(id)) value = Number(layer.get(id));
+    }
+    return this.clampParameterValue(id, value);
+  }
+
   composedParameterValue(id, options = {}) {
     const skipGroup = options.skipGroup || '';
-    const groups = Array.from(this.parameterLayers.keys()).sort((left, right) => {
-      const diff = live2dGroupPriority(left) - live2dGroupPriority(right);
-      return diff || String(left).localeCompare(String(right));
-    });
+    const groups = this.sortedMotionGroups(this.parameterLayers.keys());
 
     let value = this.defaultParameterValue(id);
     if (!Number.isFinite(Number(value))) value = 0;
 
-    // Scene is the authored absolute base. Prefer the highest-priority/current
-    // Scene layer that controls this parameter.
     for (const group of groups) {
       if (group === skipGroup || !this.isSceneGroup(group)) continue;
       const layer = this.parameterLayers.get(group);
       if (layer?.has(id)) value = Number(layer.get(id));
     }
 
-    // Every non-Scene motion contributes only its authored delta from t=0.
+    // Most non-Scene layers remain additive, matching the behavior that works
+    // best for the exported face/eye/body corrections. MouthEmotion is the
+    // exception: its curves describe a complete mouth state and must override
+    // the Scene value for the parameters the clip explicitly owns.
     for (const group of groups) {
-      if (group === skipGroup || this.isSceneGroup(group)) continue;
+      if (group === skipGroup || this.isSceneGroup(group) || group === L2D_LIP_SYNC.layer) continue;
       const layer = this.parameterLayers.get(group);
       if (!layer?.has(id)) continue;
-      const current = Number(layer.get(id));
-      if (!Number.isFinite(current)) continue;
-      const ref = this.motionReferenceValue(group, id);
-      value += current - ref;
+      const n = Number(layer.get(id));
+      if (!Number.isFinite(n)) continue;
+      if (this.isAbsoluteOverrideGroup(group)) value = n;
+      else value += n;
     }
 
     return this.clampParameterValue(id, value);
@@ -3493,7 +4498,7 @@ class NovelModelLive2D {
       const isMouthGroup = normalizeKey(group).startsWith('mouthemotion');
       for (const [id, value] of layer.entries()) {
         const isNamedMouthShape = /^ParamMouthForm/i.test(id) || /^Paramtongue$/i.test(id);
-        const isMouthGroupShape = isMouthGroup && !/^ParamMouthOpenY\d*$/i.test(id);
+        const isMouthGroupShape = isMouthGroup && this.isDiscreteMouthShapeParameter(id);
         if (isNamedMouthShape || isMouthGroupShape) entries.push([id, Number(value) || 0]);
       }
     }
@@ -3503,6 +4508,88 @@ class NovelModelLive2D {
   currentMouthFormIntensity() {
     return this.currentMouthShapeEntries()
       .reduce((intensity, [, value]) => Math.max(intensity, Math.abs(value)), 0);
+  }
+
+  parameterRange(id) {
+    const core = this.model?.internalModel?.coreModel;
+    if (!core || !id) return null;
+    try {
+      const index = core.getParameterIndex?.(id);
+      if (!Number.isInteger(index) || index < 0) return null;
+      const min = Number(core.getParameterMinimumValue?.(index));
+      const max = Number(core.getParameterMaximumValue?.(index));
+      if (Number.isFinite(min) && Number.isFinite(max) && max > min) return { min, max };
+    } catch (_) {}
+    return null;
+  }
+
+  authoredParameterRange(id) {
+    const key = String(id || '');
+    if (!key) return null;
+    if (this.authoredParameterRanges.has(key)) return this.authoredParameterRanges.get(key);
+    let min = Infinity;
+    let max = -Infinity;
+    for (const motion of new Set(this.motionMap.values())) {
+      const duration = Math.max(0.001, Number(motion?.data?.Meta?.Duration ?? motion?.duration ?? 0.5));
+      for (const curve of motion?.data?.Curves || []) {
+        if (curve?.Target !== 'Parameter' || String(curve.Id) !== key) continue;
+        // Sampling the evaluated curve avoids misreading segment type/time
+        // numbers as parameter values. 24 intervals are enough for authored
+        // mouth curves while keeping the first-use cost tiny.
+        for (let step = 0; step <= 24; step += 1) {
+          const value = evaluateMotionCurve(curve.Segments, duration * step / 24);
+          if (!Number.isFinite(Number(value))) continue;
+          min = Math.min(min, Number(value));
+          max = Math.max(max, Number(value));
+        }
+      }
+    }
+    const range = Number.isFinite(min) && Number.isFinite(max) && max >= min ? { min, max } : null;
+    this.authoredParameterRanges.set(key, range);
+    return range;
+  }
+
+  mouthTransitionGain() {
+    const state = this.activeMotionByGroup.get('MouthEmotion');
+    if (!state?.startedAt) return 1;
+    const age = Math.max(0, (performance.now() - Number(state.startedAt)) / 1000);
+    return smoothStep(clamp(age / Math.max(0.001, L2D_LIP_SYNC.mouthTransitionGuardSec), 0, 1));
+  }
+
+  composeVoiceLipSyncValue(id, base, opening) {
+    const amount = clamp(Number(opening) || 0, 0, 1);
+    const runtime = this.parameterRange(id);
+    if (!runtime) return this.clampParameterValue(id, Number(base));
+
+    const authored = this.authoredParameterRange(id);
+    let safeMin = runtime.min;
+    let safeMax = runtime.max;
+    if (authored) {
+      safeMin = Math.max(runtime.min, Number(authored.min));
+      safeMax = Math.min(runtime.max, Number(authored.max));
+    }
+    if (!(safeMax > safeMin)) {
+      safeMin = runtime.min;
+      safeMax = runtime.min + (runtime.max - runtime.min) * 0.72;
+    }
+
+    // Never let speech push the mesh outside the range that the model's own
+    // authored motions actually use. The primary figure-eight/black-block bug
+    // is fixed in MouthEmotion composition above; this clamp is a second safety
+    // boundary so voice drive cannot create a parameter combination the model
+    // author never used.
+    const authoredNeutral = clamp(Number(base), safeMin, safeMax);
+    const shapeIntensity = clamp(this.currentMouthFormIntensity(), 0, 1);
+    const drive = lerp(L2D_LIP_SYNC.safeAuthoredDrive, L2D_LIP_SYNC.strongShapeDrive, shapeIntensity);
+    const transitionGain = this.mouthTransitionGain();
+    // During speech, allow the jaw to close slightly below the scene's static
+    // mouth-open value. Otherwise a scene authored at OpenY=0.4 can only move
+    // 0.4 -> 1.0 and looks like a hinged mouth that never forms syllables.
+    const closed = lerp(authoredNeutral, safeMin, L2D_LIP_SYNC.speechClosureBlend);
+    const top = authoredNeutral + Math.max(0, safeMax - authoredNeutral) * drive;
+    const speechValue = clamp(lerp(closed, top, amount * transitionGain), safeMin, safeMax);
+    const influence = clamp(Number(this.lipSync?.weight ?? 1), 0, 1);
+    return clamp(lerp(authoredNeutral, speechValue, influence), safeMin, safeMax);
   }
 
   disableSdkIdleMotion() {
@@ -3570,101 +4657,187 @@ class NovelModelLive2D {
     }
   }
 
-  resetMotionGroup(name) {
+  resetMotionGroup(name, seconds = null) {
     const text = String(name || '');
-    if (!/Reset$/i.test(text)) return false;
-    const group = text.replace(/Reset$/i, '');
-    const ids = this.groupParameterIds.get(group);
-    if (!ids?.size) return false;
-    this.motionGeneration.set(group, (this.motionGeneration.get(group) || 0) + 1);
+    if (!isLive2DRuntimeResetName(text)) return false;
+    const base = stripLive2DResetSuffix(text);
+    const group = resolveLive2DGroup(base, base);
+    const hasState = this.parameterLayers.has(group)
+      || this.partOpacityLayers.has(group)
+      || this.modelEffectLayers.has(group)
+      || this.groupParameterIds.has(group)
+      || this.activeMotionByGroup.has(group);
+    if (!hasState) return false;
+    this.fadeMotionGroupToBase(group, seconds);
+    return true;
+  }
+
+  fadeMotionGroupToBase(groupName, seconds = null) {
+    const group = resolveLive2DGroup(groupName, groupName);
+    if (!group) return false;
+    const generation = (this.motionGeneration.get(group) || 0) + 1;
+    this.motionGeneration.set(group, generation);
     this.motionQueues.get(group)?.stopAllMotions?.();
     this.motionQueues.delete(group);
+
+    const parameterLayer = this.parameterLayers.get(group);
+    const partLayer = this.partOpacityLayers.get(group);
+    const effectLayer = this.modelEffectLayers.get(group);
     const lastMotion = this.lastMotionByGroup.get(group);
-    const fadeOut = Math.max(0, Number(lastMotion?.fadeOutTime ?? 0.2));
-    this.fadeLayerToDefaults(group, ids, fadeOut);
+    const authoredFadeOut = Number(lastMotion?.fadeOutTime ?? lastMotion?.data?.Meta?.FadeOutTime);
+    const duration = seconds == null
+      ? Math.max(0, Number.isFinite(authoredFadeOut) ? authoredFadeOut : 0.2)
+      : Math.max(0, Number(seconds) || 0);
+
+    const parameterStarts = new Map(parameterLayer || []);
+    const parameterTargets = new Map();
+    for (const id of parameterStarts.keys()) {
+      parameterTargets.set(id, this.isSceneGroup(group)
+        ? this.composedSceneBaseValue(id, { skipGroup: group })
+        : (this.isAbsoluteOverrideGroup(group)
+          ? this.composedParameterValue(id, { skipGroup: group })
+          : 0));
+    }
+    const partStarts = new Map(partLayer || []);
+    const partTargets = new Map();
+    for (const id of partStarts.keys()) partTargets.set(id, this.composedPartOpacity(id, { skipGroup: group }));
+    const effectStarts = new Map(effectLayer || []);
+
+    const finish = () => {
+      if (this.motionGeneration.get(group) !== generation) return;
+      this.parameterLayers.delete(group);
+      this.partOpacityLayers.delete(group);
+      this.modelEffectLayers.delete(group);
+      this.motionLayerReferences.delete(group);
+      this.lastMotionByGroup.delete(group);
+      this.activeMotionByGroup.delete(group);
+      this.applyHeldParameters();
+      this.applyHeldPartOpacities();
+      this.applyHeldModelOpacity();
+      this.updateMotionBadge();
+    };
+
+    if (duration <= 0 || (!parameterStarts.size && !partStarts.size && !effectStarts.size)) {
+      finish();
+      return true;
+    }
+
+    const started = performance.now();
+    const tick = () => {
+      if (!this.model || this.motionGeneration.get(group) !== generation) return;
+      const elapsed = (performance.now() - started) / 1000;
+      const weight = smoothStep(clamp(elapsed / duration, 0, 1));
+
+      if (parameterLayer) {
+        for (const [id, from] of parameterStarts.entries()) {
+          const target = Number(parameterTargets.get(id));
+          if (Number.isFinite(Number(from)) && Number.isFinite(target)) parameterLayer.set(id, lerp(Number(from), target, weight));
+        }
+      }
+      if (partLayer) {
+        for (const [id, from] of partStarts.entries()) {
+          const target = Number(partTargets.get(id));
+          if (Number.isFinite(Number(from)) && Number.isFinite(target)) partLayer.set(id, lerp(Number(from), target, weight));
+        }
+      }
+      if (effectLayer) {
+        for (const [id, from] of effectStarts.entries()) {
+          const target = live2dModelCurveDefault(id);
+          if (Number.isFinite(Number(from))) effectLayer.set(id, lerp(Number(from), target, weight));
+        }
+      }
+
+      this.applyHeldParameters();
+      this.applyHeldPartOpacities();
+      this.applyHeldModelOpacity();
+      if (weight < 1) requestAnimationFrame(tick);
+      else finish();
+    };
+    tick();
     return true;
   }
 
   fadeLayerToDefaults(group, ids, seconds) {
-    const generation = this.motionGeneration.get(group) || 0;
-    const layer = this.ensureParameterLayer(group);
-    const started = performance.now();
-    const startValues = new Map();
-    const targetValues = new Map();
-    for (const id of ids) {
-      startValues.set(id, layer.has(id) ? layer.get(id) : this.currentParameterValue(id));
-      targetValues.set(id, this.composedParameterValue(id, { skipGroup: group }));
-    }
-    const tick = () => {
-      if (!this.model || this.motionGeneration.get(group) !== generation) return;
-      const elapsed = (performance.now() - started) / 1000;
-      const weight = seconds > 0 ? smoothStep(clamp(elapsed / seconds, 0, 1)) : 1;
-      for (const id of ids) {
-        const target = targetValues.get(id);
-        if (target == null) {
-          layer.delete(id);
-          continue;
-        }
-        const start = startValues.get(id);
-        if (this.isSceneGroup(group)) {
-          layer.set(id, lerp(start ?? target, target, weight));
-        } else {
-          const ref = this.motionReferenceValue(group, id);
-          const startDelta = Number.isFinite(Number(start)) ? Number(start) - ref : 0;
-          const targetDelta = Number.isFinite(Number(target)) ? Number(target) - ref : 0;
-          layer.set(id, ref + lerp(startDelta, targetDelta, weight));
-        }
-      }
-      if (weight < 1) requestAnimationFrame(tick);
-    };
-    tick();
+    // Backwards-compatible entry point used by older call sites.
+    return this.fadeMotionGroupToBase(group, seconds);
   }
 
   stopMotionGroupForName(name) {
-    const motion = this.motionMap.get(normalizeKey(name));
-    const group = motion?.group || String(name || '').replace(/Reset$/i, '');
+    const motion = this.findMotionForTrigger(name);
+    const base = stripLive2DResetSuffix(name);
+    const group = motion ? this.motionGroup(motion) : resolveLive2DGroup(base, base);
     if (!group) return false;
-    this.motionGeneration.set(group, (this.motionGeneration.get(group) || 0) + 1);
-    this.motionQueues.get(group)?.stopAllMotions?.();
-    this.motionQueues.delete(group);
-    this.parameterLayers.delete(group);
-    this.motionLayerReferences.delete(group);
-    return true;
+    return this.fadeMotionGroupToBase(group, 0);
   }
 
   setLipSyncMode(mode) {
     const key = normalizeKey(mode || 'multi');
-    this.lipSyncModeMulti = key === 'multi' || key === 'on' || key === 'true' || key === '1';
+    if (key === 'off' || key === 'none' || key === 'false' || key === '0') this.lipSyncMode = 'off';
+    else if (key === 'single' || key === 'normal' || key === 'default') this.lipSyncMode = 'single';
+    else this.lipSyncMode = 'multi';
+    // Kept for older call sites / inspector compatibility.
+    this.lipSyncModeMulti = this.lipSyncMode === 'multi';
+    if (this.lipSyncMode === 'off') this.stopLipSync(true);
   }
 
-  playLipSync(voiceId, useMultiCharacterLipSync = true) {
-    if (!window._liveChannels?.voice) {
+  playLipSync(voiceId, mode = this.lipSyncMode) {
+    // Backward compatibility: the current app calls playLipSync(id, true/false).
+    if (typeof mode === 'boolean') mode = mode ? 'multi' : 'single';
+    // Match the original app.js contract: starting lip-sync must not depend
+    // on _liveChannels already being registered. Some replay/message paths
+    // register that channel after invoking playLipSync().
+    let resolvedMode;
+    if (typeof mode === 'boolean') resolvedMode = mode ? 'multi' : 'single';
+    else resolvedMode = normalizeKey(mode || this.lipSyncMode || 'multi');
+    if (resolvedMode === 'on' || resolvedMode === 'true' || resolvedMode === '1') resolvedMode = 'multi';
+    if (resolvedMode === 'off' || resolvedMode === 'none' || resolvedMode === 'false' || resolvedMode === '0') {
       this.stopLipSync();
       return;
     }
+    if (!['multi', 'single', 'normal', 'default'].includes(resolvedMode)) resolvedMode = 'multi';
     const suffix = extractLive2DVoiceSuffix(voiceId);
-    if (!suffix) {
-      this.stopLipSync();
-      return;
-    }
-    const parameterId = this.resolveLipSyncParameterId(suffix);
+    const parameterId = this.resolveLipSyncParameterId(suffix, resolvedMode);
     if (!parameterId) {
       this.stopLipSync();
       return;
     }
+    const now = performance.now();
     this.lipSync = {
       voiceId,
       suffix,
       parameterId,
-      useMultiCharacterLipSync,
+      formParameterId: this.resolveLipSyncFormParameterId(parameterId, suffix),
+      mode: resolvedMode,
+      useMultiCharacterLipSync: true,
       mouseY: 0,
       mouseTargetY: 0,
-      lastNow: performance.now(),
+      formY: 0,
+      formTargetY: 0,
+      voiced: 0,
+      brightness: 0.35,
+      consonant: 0,
+      lastNow: now,
+      startedAt: now,
+      holdUntil: 0,
+      weight: 1,
       releasing: false,
+      releaseStartedAt: 0,
+      releaseStartWeight: 1,
     };
   }
 
-  stopLipSync() {
+  stopLipSync(force = false) {
+    const state = this.lipSync;
+    if (!state) return;
+    if (!force) {
+      if (!state.releasing) {
+        state.releasing = true;
+        state.releaseStartedAt = performance.now();
+        state.releaseStartWeight = clamp(Number(state.weight ?? 1), 0, 1);
+        state.holdUntil = 0;
+      }
+      return;
+    }
     this.lipSync = null;
     if (!this.live2dUpdateHookInstalled) this.applyHeldParameters();
   }
@@ -3677,30 +4850,92 @@ class NovelModelLive2D {
 
   updateLipSync() {
     const state = this.lipSync;
-    if (!state?.useMultiCharacterLipSync || !state.suffix) return;
+    if (!state?.parameterId) return;
     const now = performance.now();
     const dt = Math.min(0.05, Math.max(0.001, (now - state.lastNow) / 1000));
     state.lastNow = now;
 
-    if (!window._liveChannels?.voice || !this.actualParameterExists(state.parameterId)) {
-      state.releasing = true;
+    const sound = app.controller?.sound;
+    const channelActive = !!window._liveChannels?.voice;
+    const analyserActive = !!sound?.currentVoiceAnalyser?.();
+    const ageSeconds = Math.max(0, (now - Number(state.startedAt || now)) / 1000);
+    // Do not immediately cancel the state while the audio element is starting
+    // or while a replay path is still registering its voice channel.
+    if (!this.actualParameterExists(state.parameterId) ||
+        (!channelActive && !analyserActive && ageSeconds > 0.45)) {
+      if (!state.releasing) {
+        state.releasing = true;
+        state.releaseStartedAt = now;
+        state.releaseStartWeight = clamp(Number(state.weight ?? 1), 0, 1);
+        state.holdUntil = 0;
+      }
     }
 
-    let raw = 0;
-    if (!state.releasing) raw = clamp(app.controller?.sound?.currentVoiceMouthOpening?.() || 0, 0, 1);
-    // Mild nonlinear expansion improves speech articulation without changing
-    // the Scene/Story base mouth shape.
-    const target = clamp(Math.pow(raw, 0.78) * 1.04, 0, 1);
+    let features = { opening: 0, voiced: 0, brightness: 0.35, consonant: 0 };
+    if (!state.releasing) {
+      features = sound?.currentVoiceLipFeatures?.() || features;
+      // Last-resort compatibility with the original RMS-based app.js path.
+      if (!(Number(features.opening) > 0)) {
+        const opening = sound?.currentVoiceMouthOpening?.();
+        if (Number.isFinite(Number(opening))) features.opening = Math.max(0, Number(opening));
+      }
+    }
+    const raw = clamp(Number(features.opening) || 0, 0, 1);
+    state.voiced = clamp(Number(features.voiced) || 0, 0, 1);
+    state.brightness = clamp(Number(features.brightness) || 0.35, 0, 1);
+    state.consonant = clamp(Number(features.consonant) || 0, 0, 1);
+
+    // Speech articulation is not just amplitude. Voiced vowel regions get a
+    // little more jaw opening, while high-frequency consonant/plosive regions
+    // actively close the mouth. This produces visible syllable closures rather
+    // than the old "volume meter = jaw angle" motion.
+    let target = raw <= 0.018 ? 0 : clamp(Math.pow(raw, 0.86), 0, 1);
+    target *= 1 + state.voiced * L2D_LIP_SYNC.voicedOpenBoost;
+    target *= 1 - state.consonant * L2D_LIP_SYNC.consonantCloseStrength;
+    target = clamp(target, 0, 1);
+
+    if (!state.releasing) {
+      if (state.consonant < 0.38 && target > state.mouseTargetY + 0.065) {
+        state.holdUntil = now + L2D_LIP_SYNC.syllableHoldSec * 1000;
+      }
+      if (state.consonant < 0.32 && target < state.mouseTargetY && now < state.holdUntil) {
+        target = Math.max(target, state.mouseTargetY * 0.64);
+      }
+    } else {
+      target = 0;
+      const releaseElapsed = Math.max(0, (now - Number(state.releaseStartedAt || now)) / 1000);
+      const releaseT = clamp(releaseElapsed / Math.max(0.001, L2D_LIP_SYNC.endBlendSec), 0, 1);
+      state.weight = Number(state.releaseStartWeight ?? 1) * (1 - smoothStep(releaseT));
+    }
+    if (!state.releasing) state.weight = 1;
     state.mouseTargetY = target;
 
-    const attack = 0.035;
-    const release = 0.11;
+    // On models that genuinely expose a continuous ParamMouthForm, add a very
+    // small spectral vowel-shape motion. Discrete ParamMouthFxx/Nxx selectors
+    // are deliberately never touched by LipSync.
+    state.formTargetY = state.formParameterId && !state.releasing
+      ? clamp((state.brightness - 0.42) * 2.1, -1, 1) * target
+      : 0;
+
+    const attack = L2D_LIP_SYNC.attackSec;
+    let release = state.releasing
+      ? Math.min(L2D_LIP_SYNC.tailReleaseSec, L2D_LIP_SYNC.endCloseSec)
+      : L2D_LIP_SYNC.releaseSec;
+    if (!state.releasing && state.consonant > 0.42 && target < state.mouseY) {
+      release = Math.min(release, L2D_LIP_SYNC.consonantReleaseSec);
+    }
     const tau = target > state.mouseY ? attack : release;
-    const alpha = 1 - Math.exp(-dt / tau);
+    const alpha = 1 - Math.exp(-dt / Math.max(0.001, tau));
     state.mouseY = lerp(state.mouseY, target, alpha);
 
-    if (state.releasing && state.mouseY < 0.005) {
-      this.stopLipSync();
+    const formTau = Math.abs(state.formTargetY) > Math.abs(state.formY)
+      ? L2D_LIP_SYNC.formAttackSec
+      : L2D_LIP_SYNC.formReleaseSec;
+    const formAlpha = 1 - Math.exp(-dt / Math.max(0.001, formTau));
+    state.formY = lerp(state.formY, state.formTargetY, formAlpha);
+
+    if (state.releasing && state.weight <= 0.002) {
+      this.stopLipSync(true);
       return;
     }
   }
@@ -3754,6 +4989,7 @@ class NovelModelLive2D {
     this.renderMosaicOverlay();
   }
 }
+
 
 class NovelModelAsync {
   constructor() {
@@ -5772,7 +7008,7 @@ function resolveSceneAssetInfo(asset) {
       src: `${BG_DATA_ROOT}${bgKey}.png`,
       width,
       height,
-      fullFrame: isNovelBgPath || (width >= 512 && height >= 512),
+      fullFrame: isNovelBgPath || /^abg\d+[a-z]?$/i.test(leaf) || (width >= 512 && height >= 512),
     };
   }
   return { src: '', width: 0, height: 0, fullFrame: false };
@@ -5813,17 +7049,7 @@ function normalizeCharaFace(value) {
 }
 
 function currentCharaFaceKey(item) {
-  // EyeClose is a transient override of the same face slot. Reuse the exact
-  // FaceContent positioning instead of stacking a second face canvas.
-  if (item.eyeClosed) {
-    const until = Number(item.eyeBlinkUntil) || 0;
-    if (until <= 0 || performance.now() < until) {
-      if (item.asset?.faces?.closed || item.asset?.faces?.eyeclose) return 'closed';
-    } else {
-      item.eyeClosed = false;
-      item.eyeBlinkUntil = 0;
-    }
-  }
+  if (item.eyeClosed && item.asset?.faces?.closed) return 'closed';
   return item.baseFace || 'normal';
 }
 
@@ -6386,3 +7612,4 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 });
+
