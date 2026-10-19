@@ -1,0 +1,15 @@
+{
+  "updated_at": "2026-10-19T23:47:35+08:00",
+  "catalog": "C:\\Users\\Administrator\\Desktop\\Dot离线资源维护器1.3\\catalog_1.bin",
+  "resource_count": 23635,
+  "delta_updated": false,
+  "delta_count": null,
+  "first_build": false,
+  "backup_policy": "覆盖写入，不保留历史备份",
+  "table_files": [
+    "资源表.csv",
+    "资源表.json",
+    "新增资源表.csv",
+    "新增资源表.json"
+  ]
+}

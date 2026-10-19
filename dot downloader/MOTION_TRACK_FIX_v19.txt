@@ -1,5 +1,0 @@
-Motion v19 fix:
-- Restores Cubism Model tracks Opacity, EyeBlink, LipSync from FadeMotionData track ordering when Unity AnimationClip bindings have empty transform paths.
-- Keeps Param* tracks as Target=Parameter.
-- Does not modify curve sampling, key times, slopes, loop or Story parsing.
-- Regression: EyeEmotionLeft five input float curves -> five output curves: Model/Opacity, Model/EyeBlink, Model/LipSync, Parameter/ParamEyeBallX, Parameter/ParamEyeBallY.

@@ -1,0 +1,14 @@
+{
+  "project_root": "C:/Users/Administrator/Downloads/像素深渊离线V1.1.1",
+  "catalog": "C:\\Users\\Administrator\\Desktop\\Dot离线资源维护器1.3\\catalog_1.bin",
+  "cdn_version": "12394",
+  "catalog_url": "https://api.abyss-prod-r18.dotabyss.dmmgames.com/resources/webgl/r18/aas/12394/aa/catalog_1.bin",
+  "catalog_base_url": "https://api.abyss-prod-r18.dotabyss.dmmgames.com/resources/webgl/r18/aas/12394/aa/",
+  "asset_library_root": "catalog_asset_library",
+  "raw_bundle_root": "raw_bundles",
+  "resource_table_root": "resource_tables",
+  "extract_after_download": true,
+  "include_common_resources": true,
+  "download_workers": 30,
+  "auto_update_index": true
+}
