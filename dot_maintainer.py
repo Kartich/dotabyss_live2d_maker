@@ -32,11 +32,11 @@ class App(tk.Tk):
         self.title(APP_TITLE)
         # Adaptive window: use most of the screen without exceeding a comfortable desktop size.
         # Functional tabs are scrollable, so smaller/laptop displays still expose every action.
-        sw=max(960,self.winfo_screenwidth()); sh=max(640,self.winfo_screenheight())
-        ww=min(1360,max(980,int(sw*0.92))); wh=min(960,max(680,int(sh*0.90)))
+        sw=max(640,self.winfo_screenwidth()); sh=max(480,self.winfo_screenheight())
+        ww=min(1360,max(640,int(sw*0.92))); wh=min(960,max(480,int(sh*0.90)))
         x=max(0,(sw-ww)//2); y=max(0,(sh-wh)//2)
         self.geometry(f'{ww}x{wh}+{x}+{y}')
-        self.minsize(860, 620)
+        self.minsize(640, 480)
         self.proc=None
         self.log_queue=queue.Queue()
         self.running=False
@@ -71,6 +71,9 @@ class App(tk.Tk):
         try: configured_workers=int(self.config_data.get('download_workers', IO_WORKERS) or IO_WORKERS)
         except Exception: configured_workers=IO_WORKERS
         self.download_workers_var=tk.IntVar(value=max(1,min(64,configured_workers)))
+        try: red_blue_max=int(self.config_data.get('l2d_red_blue_max',25) or 25)
+        except Exception: red_blue_max=25
+        self.l2d_red_blue_max_var=tk.IntVar(value=max(0,min(40,red_blue_max)))
         self.resource_selected_names=set()
         self._rendering_resource_tree=False
         self.job_workspace='player'
@@ -121,43 +124,100 @@ class App(tk.Tk):
             'extract_after_download':bool(self.extract_original_var.get()),
             'include_common_resources':bool(self.include_common_var.get()),
             'download_workers':self._io_workers(),
+            'l2d_red_blue_max':max(0,min(40,int(self.l2d_red_blue_max_var.get()))),
             'auto_update_index':bool(self.auto_index_var.get()),
         }
         try: CONFIG_PATH.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
         except Exception: pass
 
     def _style(self):
-        self.configure(bg='#0d1424')
-        st=ttk.Style(self)
-        try: st.theme_use('clam')
-        except Exception: pass
-        st.configure('Root.TFrame',background='#0d1424')
-        st.configure('Card.TFrame',background='#151f33')
-        st.configure('TLabel',background='#0d1424',foreground='#e6edf7',font=('Microsoft YaHei UI',10))
-        st.configure('Card.TLabel',background='#151f33',foreground='#e6edf7',font=('Microsoft YaHei UI',10))
-        st.configure('Muted.TLabel',background='#0d1424',foreground='#9aa9bf',font=('Microsoft YaHei UI',9))
-        st.configure('CardMuted.TLabel',background='#151f33',foreground='#a8b4c7',font=('Microsoft YaHei UI',9))
-        st.configure('Title.TLabel',background='#0d1424',foreground='#fff',font=('Microsoft YaHei UI',20,'bold'))
-        st.configure('Section.TLabel',background='#151f33',foreground='#fff',font=('Microsoft YaHei UI',11,'bold'))
-        st.configure('TButton',font=('Microsoft YaHei UI',10),padding=(11,7))
-        st.configure('Accent.TButton',font=('Microsoft YaHei UI',10,'bold'),padding=(13,8))
-        st.configure('Danger.TButton',font=('Microsoft YaHei UI',10,'bold'),padding=(13,8))
-        st.configure('TEntry',fieldbackground='#0a1120',foreground='#f8fafc',insertcolor='#fff',padding=6)
-        st.configure('TNotebook',background='#0d1424',borderwidth=0)
-        st.configure('TNotebook.Tab',font=('Microsoft YaHei UI',10,'bold'),padding=(16,8))
-        st.configure('TLabelframe',background='#151f33',foreground='#fff')
-        st.configure('TLabelframe.Label',background='#151f33',foreground='#fff',font=('Microsoft YaHei UI',10,'bold'))
+        """Modern dark desktop theme: restrained slate surfaces, teal accents and clearer hierarchy."""
+        self.configure(bg='#0b1020')
+        st = ttk.Style(self)
+        try:
+            st.theme_use('clam')
+        except Exception:
+            pass
+
+        bg = '#0b1020'
+        card = '#121c2e'
+        elevated = '#18263b'
+        field = '#0a1425'
+        fg = '#e8eef8'
+        muted = '#94a6bf'
+        accent = '#38bdf8'
+        accent_hover = '#67d3ff'
+        border = '#26364e'
+        selected = '#164e63'
+
+        st.configure('Root.TFrame', background=bg)
+        st.configure('Card.TFrame', background=card, relief='flat')
+        st.configure('TLabel', background=bg, foreground=fg, font=('Microsoft YaHei UI', 10))
+        st.configure('Card.TLabel', background=card, foreground=fg, font=('Microsoft YaHei UI', 10))
+        st.configure('Muted.TLabel', background=bg, foreground=muted, font=('Microsoft YaHei UI', 9))
+        st.configure('CardMuted.TLabel', background=card, foreground=muted, font=('Microsoft YaHei UI', 9))
+        st.configure('Title.TLabel', background=bg, foreground='#f8fbff', font=('Microsoft YaHei UI', 21, 'bold'))
+        st.configure('Section.TLabel', background=card, foreground='#f5f9ff', font=('Microsoft YaHei UI', 11, 'bold'))
+
+        st.configure('TButton', font=('Microsoft YaHei UI', 9), padding=(12, 8), background=elevated,
+                     foreground=fg, borderwidth=1, relief='flat', focuscolor=accent)
+        st.map('TButton', background=[('disabled', '#172235'), ('pressed', '#20344d'), ('active', '#223650')],
+               foreground=[('disabled', '#64748b'), ('active', '#ffffff')],
+               bordercolor=[('focus', accent), ('active', '#3b5878')])
+        st.configure('Accent.TButton', font=('Microsoft YaHei UI', 9, 'bold'), padding=(14, 9),
+                     background='#0e7490', foreground='#ffffff', borderwidth=0, relief='flat')
+        st.map('Accent.TButton', background=[('disabled', '#26394b'), ('pressed', '#155e75'), ('active', '#0891b2')],
+               foreground=[('disabled', '#8ca0b6'), ('active', '#ffffff')])
+        st.configure('Danger.TButton', font=('Microsoft YaHei UI', 9, 'bold'), padding=(13, 8),
+                     background='#7f1d3a', foreground='#fff1f2', borderwidth=0)
+        st.map('Danger.TButton', background=[('pressed', '#881337'), ('active', '#9f1239')])
+
+        st.configure('TEntry', fieldbackground=field, foreground=fg, insertcolor='#ffffff', padding=(8, 7),
+                     bordercolor=border, lightcolor=border, darkcolor=border, relief='flat')
+        st.map('TEntry', bordercolor=[('focus', accent)], lightcolor=[('focus', accent)], darkcolor=[('focus', accent)])
+        st.configure('TCombobox', fieldbackground=field, background=elevated, foreground=fg,
+                     arrowcolor=accent, padding=(8, 6), bordercolor=border, lightcolor=border, darkcolor=border)
+        st.map('TCombobox', fieldbackground=[('readonly', field), ('focus', field)],
+               foreground=[('readonly', fg)], background=[('active', '#223650')],
+               selectbackground=[('readonly', selected)], selectforeground=[('readonly', '#ffffff')])
+        st.configure('TSpinbox', fieldbackground=field, foreground=fg, insertcolor='#ffffff',
+                     arrowcolor=accent, padding=(7, 5), bordercolor=border)
+        st.configure('TCheckbutton', background=card, foreground=fg, font=('Microsoft YaHei UI', 10), padding=(2, 4))
+        st.map('TCheckbutton', background=[('active', card)], foreground=[('disabled', '#64748b'), ('active', '#ffffff')])
+
+        st.configure('TNotebook', background=bg, borderwidth=0, tabmargins=(2, 6, 2, 0))
+        st.configure('TNotebook.Tab', font=('Microsoft YaHei UI', 10, 'bold'), padding=(17, 10),
+                     background='#111b2c', foreground=muted, borderwidth=0)
+        st.map('TNotebook.Tab', background=[('selected', '#164e63'), ('active', elevated)],
+               foreground=[('selected', '#f0fdff'), ('active', fg)], expand=[('selected', (1, 1, 1, 0))])
+        st.configure('TLabelframe', background=card, foreground=fg, bordercolor=border, relief='solid', borderwidth=1)
+        st.configure('TLabelframe.Label', background=card, foreground='#d9f5ff', font=('Microsoft YaHei UI', 10, 'bold'))
+
+        st.configure('Treeview', background=field, fieldbackground=field, foreground=fg,
+                     rowheight=30, borderwidth=0, relief='flat', font=('Microsoft YaHei UI', 9))
+        st.map('Treeview', background=[('selected', selected)], foreground=[('selected', '#ffffff')])
+        st.configure('Treeview.Heading', background='#1b2a40', foreground='#dce8f7',
+                     font=('Microsoft YaHei UI', 9, 'bold'), padding=(9, 9), relief='flat', borderwidth=0)
+        st.map('Treeview.Heading', background=[('active', '#263c56')], foreground=[('active', '#ffffff')])
+        st.configure('TScrollbar', background='#1b2a40', troughcolor=bg, bordercolor=bg,
+                     arrowcolor=muted, relief='flat')
+        st.map('TScrollbar', background=[('active', '#36516f'), ('pressed', '#0e7490')])
+        st.configure('TProgressbar', troughcolor='#202e43', background=accent, bordercolor='#202e43',
+                     lightcolor=accent, darkcolor=accent, thickness=8)
 
     def _ui(self):
         outer=ttk.Frame(self,style='Root.TFrame',padding=16); outer.pack(fill='both',expand=True)
         head=ttk.Frame(outer,style='Root.TFrame'); head.pack(fill='x')
-        ttk.Label(head,text=APP_TITLE,style='Title.TLabel').pack(side='left')
-        ttk.Button(head,text='设置',command=self.open_settings).pack(side='right',padx=(8,0))
-        ttk.Button(head,text='打开提取目录',command=self.open_asset_library).pack(side='right',padx=(8,0))
-        ttk.Button(head,text='打开资源表目录',command=self.open_resource_tables).pack(side='right',padx=(8,0))
-        self.busy=ttk.Progressbar(head,mode='indeterminate',length=150); self.busy.pack(side='right',padx=(10,0))
-        ttk.Label(head,textvariable=self.status_var,style='Muted.TLabel').pack(side='right')
+        title_row=ttk.Frame(head,style='Root.TFrame'); title_row.pack(fill='x')
+        ttk.Label(title_row,text=APP_TITLE,style='Title.TLabel').pack(side='left',anchor='w')
+        self.busy=ttk.Progressbar(title_row,mode='indeterminate',length=100); self.busy.pack(side='right',padx=(8,0))
+        ttk.Label(title_row,textvariable=self.status_var,style='Muted.TLabel').pack(side='right')
+        toolbar=ttk.Frame(head,style='Root.TFrame'); toolbar.pack(fill='x',pady=(6,0))
+        ttk.Button(toolbar,text='设置',command=self.open_settings).pack(side='left',padx=(0,6))
+        ttk.Button(toolbar,text='打开提取目录',command=self.open_asset_library).pack(side='left',padx=(0,6))
+        ttk.Button(toolbar,text='打开资源表目录',command=self.open_resource_tables).pack(side='left')
         ttk.Label(outer,text='播放器维护与独立人物资源提取分区运行；Catalog、路径、下载并发和提取策略统一在“设置”中调整。',style='Muted.TLabel').pack(anchor='w',pady=(3,8))
+        tk.Frame(outer, height=2, bg='#0e7490', bd=0, highlightthickness=0).pack(fill='x', pady=(0, 12))
 
         progress=ttk.Frame(outer,style='Card.TFrame',padding=(12,9)); progress.pack(fill='x',pady=(0,10))
         prow=ttk.Frame(progress,style='Card.TFrame'); prow.pack(fill='x')
@@ -197,14 +257,15 @@ class App(tk.Tk):
         self.asset_log_tab=ttk.Frame(self.asset_tabs,style='Root.TFrame',padding=10)
         self.asset_tabs.add(self.resource_page,text='资源表与指定下载')
         self.asset_tabs.add(self.asset_log_tab,text='提取任务日志')
-        self._resource_browser_ui(self.resource_page)
+        self.resource_page_content=self._scrollable_page(self.resource_page)
+        self._resource_browser_ui(self.resource_page_content)
         self._log_ui(self.asset_log_tab, asset=True)
 
     def _scrollable_page(self,parent):
         """Create a vertically scrollable notebook page for small/high-DPI displays."""
         holder=ttk.Frame(parent,style='Root.TFrame')
         holder.pack(fill='both',expand=True)
-        canvas=tk.Canvas(holder,bg='#0d1424',highlightthickness=0,borderwidth=0)
+        canvas=tk.Canvas(holder,bg='#0b1020',highlightthickness=0,borderwidth=0)
         scroll=ttk.Scrollbar(holder,orient='vertical',command=canvas.yview)
         canvas.configure(yscrollcommand=scroll.set)
         scroll.pack(side='right',fill='y')
@@ -250,7 +311,7 @@ class App(tk.Tk):
 
     def _download_ui(self):
         card=self._card(self.download_tab,'按 ID 下载 / 一键下载并处理','保留原下载器功能。所有原始 Bundle 统一缓存在维护器目录 raw_bundles 中，不再按任务分文件夹；同名 Bundle 已存在时直接复用。下载并处理只处理本次清单，不扫描历史缓存。支持角色 ID、11 位剧情 ID、BGM/SE/BG 等具体资源 ID。')
-        self.ids_text=tk.Text(card,height=5,bg='#0a1120',fg='#e6edf7',insertbackground='#fff',relief='flat',font=('Consolas',10))
+        self.ids_text=tk.Text(card,height=5,bg='#0a1425',fg='#e8eef8',insertbackground='#fff',relief='flat',font=('Consolas',10))
         self.ids_text.pack(fill='x')
         opts=ttk.Frame(card,style='Card.TFrame'); opts.pack(fill='x',pady=(10,0))
         ttk.Checkbutton(opts,text='下载并处理后自动更新索引',variable=self.auto_index_var).pack(side='left')
@@ -368,14 +429,14 @@ class App(tk.Tk):
 
         filters=ttk.Frame(outer,style='Card.TFrame',padding=10); filters.pack(fill='x',pady=(10,8))
         ttk.Label(filters,text='关键字 / 人物ID / 剧情ID / Bundle 名称',style='Card.TLabel').grid(row=0,column=0,sticky='w')
-        q=ttk.Entry(filters,textvariable=self.resource_query_var,width=38); q.grid(row=1,column=0,sticky='ew',pady=(3,0))
+        q=ttk.Entry(filters,textvariable=self.resource_query_var,width=24); q.grid(row=1,column=0,sticky='ew',pady=(3,0))
         ttk.Label(filters,text='资源类别',style='Card.TLabel').grid(row=0,column=1,sticky='w',padx=(10,0))
-        self.resource_kind_combo=ttk.Combobox(filters,textvariable=self.resource_kind_var,state='readonly',width=20,values=['全部类型']); self.resource_kind_combo.grid(row=1,column=1,padx=(10,0),pady=(3,0))
+        self.resource_kind_combo=ttk.Combobox(filters,textvariable=self.resource_kind_var,state='readonly',width=14,values=['全部类型']); self.resource_kind_combo.grid(row=1,column=1,padx=(10,0),pady=(3,0))
         ttk.Label(filters,text='资源范围',style='Card.TLabel').grid(row=0,column=2,sticky='w',padx=(10,0))
-        self.resource_scope_combo=ttk.Combobox(filters,textvariable=self.resource_scope_var,state='readonly',width=13,values=['全部范围','公共','R18','未判定']); self.resource_scope_combo.grid(row=1,column=2,padx=(10,0),pady=(3,0))
-        ttk.Button(filters,text='筛选',command=self._apply_resource_filter).grid(row=1,column=3,padx=(10,0),pady=(3,0))
-        ttk.Button(filters,text='重置',command=self._reset_resource_filter).grid(row=1,column=4,padx=(6,0),pady=(3,0))
-        self.resource_load_button=ttk.Button(filters,text='重新载入本地 Catalog',command=lambda:self.load_resource_table(save_delta=False)); self.resource_load_button.grid(row=1,column=5,padx=(6,0),pady=(3,0))
+        self.resource_scope_combo=ttk.Combobox(filters,textvariable=self.resource_scope_var,state='readonly',width=10,values=['全部范围','公共','R18','未判定']); self.resource_scope_combo.grid(row=1,column=2,padx=(10,0),pady=(3,0))
+        ttk.Button(filters,text='筛选',command=self._apply_resource_filter).grid(row=2,column=0,sticky='w',pady=(7,0))
+        ttk.Button(filters,text='重置',command=self._reset_resource_filter).grid(row=2,column=1,sticky='w',padx=(6,0),pady=(7,0))
+        self.resource_load_button=ttk.Button(filters,text='重新载入本地 Catalog',command=lambda:self.load_resource_table(save_delta=False)); self.resource_load_button.grid(row=2,column=2,sticky='w',padx=(6,0),pady=(7,0))
         filters.columnconfigure(0,weight=1)
         pagebar=ttk.Frame(outer,style='Root.TFrame'); pagebar.pack(fill='x',pady=(0,5))
         ttk.Label(pagebar,textvariable=self.resource_status_var,style='Muted.TLabel').pack(side='left',fill='x',expand=True)
@@ -385,7 +446,7 @@ class App(tk.Tk):
 
         table_frame=ttk.Frame(outer,style='Root.TFrame'); table_frame.pack(fill='both',expand=True)
         columns=('name','kind','character_ids','story_ids','downloaded')
-        self.resource_tree=ttk.Treeview(table_frame,columns=columns,show='headings',selectmode='extended',height=19)
+        self.resource_tree=ttk.Treeview(table_frame,columns=columns,show='headings',selectmode='extended',height=10)
         headings={'name':'资源名称 / Bundle（完整名称可在下方详情查看）','kind':'资源类型','character_ids':'人物ID','story_ids':'关联剧情ID','downloaded':'已下载'}
         widths={'name':720,'kind':190,'character_ids':115,'story_ids':135,'downloaded':78}
         for col in columns:
@@ -398,20 +459,29 @@ class App(tk.Tk):
         table_frame.rowconfigure(0,weight=1); table_frame.columnconfigure(0,weight=1)
         self.resource_tree.bind('<Double-1>',self._resource_row_double_click)
         self.resource_tree.bind('<<TreeviewSelect>>',self._resource_selection_changed)
+        self.resource_tree.bind('<MouseWheel>',lambda e:(self.resource_tree.yview_scroll(-1 if e.delta>0 else 1,'units'),'break')[1])
+        self.resource_tree.bind('<Button-4>',lambda e:(self.resource_tree.yview_scroll(-1,'units'),'break')[1])
+        self.resource_tree.bind('<Button-5>',lambda e:(self.resource_tree.yview_scroll(1,'units'),'break')[1])
 
         detail=ttk.Frame(outer,style='Card.TFrame',padding=(10,6)); detail.pack(fill='x',pady=(4,0))
         self.resource_detail_var=tk.StringVar(value='选择资源行后显示完整 Bundle 名称、推断路径与关联信息。')
         ttk.Label(detail,textvariable=self.resource_detail_var,style='CardMuted.TLabel',wraplength=1200,justify='left').pack(fill='x')
 
         quick=ttk.Frame(outer,style='Card.TFrame',padding=8); quick.pack(fill='x',pady=(7,0))
-        ttk.Label(quick,text='快速选择：',style='Card.TLabel').pack(side='left')
-        ttk.Button(quick,text='全选本页',command=self.select_current_resource_page).pack(side='left',padx=(6,0))
-        ttk.Button(quick,text='全选筛选结果',command=self.select_all_filtered_resources).pack(side='left',padx=(6,0))
-        ttk.Button(quick,text='反选筛选结果',command=self.invert_filtered_resources).pack(side='left',padx=(6,0))
-        ttk.Button(quick,text='仅选 L2D',command=lambda:self.quick_select_resource_kinds(('l2d_motion','l2d_core','l2d_fade','Live2D','L2D'))).pack(side='left',padx=(6,0))
-        ttk.Button(quick,text='仅选人物立绘',command=lambda:self.quick_select_resource_kinds(('stand','stand_helper','character_cutout','unitcutin'))).pack(side='left',padx=(6,0))
-        ttk.Button(quick,text='仅选人物核心资源',command=self.quick_select_character_core).pack(side='left',padx=(6,0))
-        ttk.Button(quick,text='清空选择',command=self.clear_resource_selection).pack(side='left',padx=(6,0))
+        ttk.Label(quick,text='快速选择',style='Card.TLabel').grid(row=0,column=0,sticky='w',padx=(0,8),pady=3)
+        quick_buttons=[
+            ('全选本页',self.select_current_resource_page),
+            ('全选筛选结果',self.select_all_filtered_resources),
+            ('反选筛选结果',self.invert_filtered_resources),
+            ('仅选 L2D',lambda:self.quick_select_resource_kinds(('l2d_motion','l2d_core','l2d_fade','Live2D','L2D'))),
+            ('仅选人物立绘',lambda:self.quick_select_resource_kinds(('stand','stand_helper','character_cutout','unitcutin'))),
+            ('仅选人物核心资源',self.quick_select_character_core),
+            ('清空选择',self.clear_resource_selection),
+        ]
+        for qi,(label,command) in enumerate(quick_buttons):
+            r=qi//3; c=qi%3
+            ttk.Button(quick,text=label,command=command).grid(row=r,column=c+1,sticky='ew',padx=3,pady=3)
+        for qc in range(1,4): quick.columnconfigure(qc,weight=1)
 
         actions=ttk.Frame(outer,style='Card.TFrame',padding=10); actions.pack(fill='x',pady=(8,0))
         ttk.Label(actions,text='下载与提取方式由“设置 → 下载与提取”统一控制',style='Card.TLabel').grid(row=0,column=0,sticky='w')
@@ -490,14 +560,17 @@ class App(tk.Tk):
             self.settings_window.deiconify(); self.settings_window.lift(); return
         win=tk.Toplevel(self); self.settings_window=win
         win.title('Dot 离线资源维护器 - 设置')
-        win.configure(bg='#0d1424'); win.geometry('920x690'); win.minsize(780,580)
+        win.configure(bg='#0b1020')
+        sw=max(640,self.winfo_screenwidth()); sh=max(480,self.winfo_screenheight())
+        win.geometry(f'{min(920,sw-30)}x{min(690,sh-60)}'); win.minsize(620,440)
         win.transient(self)
         outer=ttk.Frame(win,style='Root.TFrame',padding=14); outer.pack(fill='both',expand=True)
         ttk.Label(outer,text='设置',style='Title.TLabel').pack(anchor='w')
         ttk.Label(outer,text='路径与 Catalog、下载并发、提取方式在此统一调整；保存后立即用于后续任务。',style='Muted.TLabel').pack(anchor='w',pady=(2,10))
         tabs=ttk.Notebook(outer); tabs.pack(fill='both',expand=True)
-        paths=ttk.Frame(tabs,style='Root.TFrame',padding=12); behavior=ttk.Frame(tabs,style='Root.TFrame',padding=12); player=ttk.Frame(tabs,style='Root.TFrame',padding=12)
-        tabs.add(paths,text='路径与 Catalog'); tabs.add(behavior,text='下载与提取'); tabs.add(player,text='播放器选项')
+        paths_host=ttk.Frame(tabs,style='Root.TFrame'); behavior_host=ttk.Frame(tabs,style='Root.TFrame'); player_host=ttk.Frame(tabs,style='Root.TFrame')
+        tabs.add(paths_host,text='路径与 Catalog'); tabs.add(behavior_host,text='下载与提取'); tabs.add(player_host,text='播放器选项')
+        paths=self._scrollable_page(paths_host); behavior=self._scrollable_page(behavior_host); player=self._scrollable_page(player_host)
 
         def path_row(parent,row,label,var,kind='folder',filetypes=None):
             ttk.Label(parent,text=label,style='Card.TLabel').grid(row=row,column=0,sticky='w',pady=6)
@@ -523,8 +596,11 @@ class App(tk.Tk):
         ttk.Spinbox(behavior,from_=1,to=64,textvariable=self.download_workers_var,width=8).grid(row=0,column=1,sticky='w',pady=(4,9))
         ttk.Checkbutton(behavior,text='下载后自动按 Bundle 内部原目录提取分类',variable=self.extract_original_var).grid(row=1,column=0,columnspan=2,sticky='w',pady=7)
         ttk.Checkbutton(behavior,text='人物资源提取时追踪并补齐剧情引用的公共背景 / BGM / SE',variable=self.include_common_var).grid(row=2,column=0,columnspan=2,sticky='w',pady=7)
-        ttk.Label(behavior,text='资源表固定自动保存：每次 Catalog 更新覆盖当前表，并覆盖生成新增资源表；不保留历史备份。',style='CardMuted.TLabel',wraplength=760).grid(row=3,column=0,columnspan=3,sticky='w',pady=(12,5))
-        ttk.Label(behavior,text='资源表字段不包含 Hash 和扩展名。',style='CardMuted.TLabel').grid(row=4,column=0,columnspan=3,sticky='w')
+        ttk.Label(behavior,text='L2D 红色块蓝色阈值 B（0–40，默认 25）',style='Card.TLabel').grid(row=3,column=0,sticky='w',pady=(8,5))
+        ttk.Spinbox(behavior,from_=0,to=40,increment=1,textvariable=self.l2d_red_blue_max_var,width=8).grid(row=3,column=1,sticky='w',pady=(8,5))
+        ttk.Label(behavior,text='仅对 L2D 模型引用的贴图执行：R=255、G=0、B 不大于此值的像素设为透明。FF0018 对应 B=24。',style='CardMuted.TLabel',wraplength=760).grid(row=4,column=0,columnspan=3,sticky='w',pady=(0,8))
+        ttk.Label(behavior,text='资源表固定自动保存：每次 Catalog 更新覆盖当前表，并覆盖生成新增资源表；不保留历史备份。',style='CardMuted.TLabel',wraplength=760).grid(row=5,column=0,columnspan=3,sticky='w',pady=(8,5))
+        ttk.Label(behavior,text='资源表字段不包含 Hash 和扩展名。',style='CardMuted.TLabel').grid(row=6,column=0,columnspan=3,sticky='w')
 
         ttk.Checkbutton(player,text='播放器资源处理后自动更新索引',variable=self.auto_index_var).grid(row=0,column=0,sticky='w',pady=(4,10))
         ttk.Label(player,text='播放器根目录需包含 data_r18_all；独立人物资源提取不依赖此目录。',style='CardMuted.TLabel',wraplength=760).grid(row=1,column=0,sticky='w')
@@ -544,6 +620,11 @@ class App(tk.Tk):
             if not 1<=workers<=64: raise ValueError
         except Exception:
             messagebox.showwarning('线程数无效','下载线程数范围为 1–64。',parent=win); return
+        try:
+            red_blue_max=int(self.l2d_red_blue_max_var.get())
+            if not 0<=red_blue_max<=40: raise ValueError
+        except Exception:
+            messagebox.showwarning('L2D 红色块阈值无效','B 阈值范围为 0–40，默认值为 25。',parent=win); return
         self._save_config()
         self.resource_table_summary_var.set(f'资源表目录：{self._resolve_configured_path(self.resource_table_root_var.get(),TOOL_DIR/"resource_tables")}')
         win.destroy()
@@ -778,7 +859,7 @@ class App(tk.Tk):
         if character_id and self.extract_original_var.get():
             conversion_root=output/character_id
             manifest=raw/'.dot_runtime'/('manifest_character_'+character_id+'.json')
-            pipeline_cmd=self._py('run_character_conversion.py','--manifest',manifest,'--raw-dir',raw,'--output-root',conversion_root,'--base-url',parsed['base_url'],'--workers',str(self._io_workers()))
+            pipeline_cmd=self._py('run_character_conversion.py','--manifest',manifest,'--raw-dir',raw,'--output-root',conversion_root,'--base-url',parsed['base_url'],'--workers',str(self._io_workers()),'--red-blue-max',str(max(0,min(40,int(self.l2d_red_blue_max_var.get())))))
             commands.append((pipeline_cmd,{0}))
         label=(f'人物 {character_id} 关联资源下载、提取与转换' if character_id else f'指定 Bundle 下载 {len(names)} 项')
         self.run_commands(commands,label,callback=lambda:self.load_resource_table(save_delta=False))
@@ -827,7 +908,12 @@ class App(tk.Tk):
         cat=Path(self.catalog_var.get()).expanduser().resolve()
         if need_version:
             if not cat.is_file(): messagebox.showwarning('缺少 Catalog',f'找不到：\n{cat}'); return None
-            if not self.version_var.get().strip().isdigit(): messagebox.showwarning('CDN 版本号错误','请输入纯数字，例如 8374。上方保留了版本号获取指引。'); return None
+            # Accept a valid full Catalog URL as the source of the Bundle base URL;
+            # the numeric version field is only required for legacy version-only mode.
+            active_base = self._active_base_url() or getattr(self, 'catalog_base_url', '') or os.environ.get('DOT_CATALOG_BASE_URL', '').strip()
+            if not active_base and not self.version_var.get().strip().isdigit():
+                messagebox.showwarning('CDN 地址/版本号缺失','请填写完整的 catalog_1.bin 下载地址，或输入纯数字 CDN 版本号，例如 8374。')
+                return None
         self._save_config(); return root
 
     def _env(self,root):

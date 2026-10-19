@@ -10,5 +10,6 @@
   "extract_after_download": true,
   "include_common_resources": true,
   "download_workers": 30,
+  "l2d_red_blue_max": 25,
   "auto_update_index": true
 }

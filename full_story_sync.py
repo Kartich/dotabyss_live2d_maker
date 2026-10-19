@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import threading
+from urllib.parse import urlsplit
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -353,9 +354,15 @@ def repair(root: Path, catalog: Path, version: str, classified, rows, download_w
         emit_progress(60,'提取并分类剧情资源',f'本次精确处理 {len(rows_manifest)} 个 Bundle，不扫描历史缓存')
         cmd=[
             sys.executable,'-u',str(TOOL_DIR/'run_pipeline.py'),
-            '--manifest',str(manifest),'--version',str(version),
-            '--workers',str(workers_for(requested=download_workers)),
+            '--manifest',str(manifest),
         ]
+        # Keep URL configuration intact across the subprocess boundary. Passing an
+        # empty --version here used to make the extraction stage fail after download.
+        if active_base:
+            cmd.extend(['--base-url', active_base.rstrip('/') + '/'])
+        else:
+            cmd.extend(['--version', str(version)])
+        cmd.extend(['--workers',str(workers_for(requested=download_workers))])
         print('> '+subprocess.list2cmdline(cmd),flush=True)
         code=_stream_process(cmd,cwd=root,env=env,progress_base=60,progress_span=28,stage='提取并分类剧情资源',detail_prefix='批量补充')
         if code!=0:
@@ -400,8 +407,26 @@ def main(argv=None):
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
-    if not args.scan_only and not str(args.version).strip().isdigit():
-        raise SystemExit("全量补充需要 CDN 版本号，例如 8374。")
+    # Accept the same full Bundle base URL used by the other download modules.
+    # A valid --base-url is authoritative; --version is only the legacy fallback.
+    base_url = str(args.base_url or os.environ.get("DOT_CATALOG_BASE_URL", "")).strip()
+    version = str(args.version or "").strip()
+    if base_url:
+        parsed_base = urlsplit(base_url)
+        if parsed_base.scheme not in ("http", "https") or not parsed_base.netloc:
+            raise SystemExit("Bundle 基础地址无效，请使用完整 Catalog 地址对应的 /aas/<版本>/aa/ 地址。")
+        path = parsed_base.path.rstrip("/")
+        if not re.search(r"/aas/[^/]+/aa$", path, re.I):
+            raise SystemExit("Bundle 基础地址路径异常，应类似 https://.../aas/12394/aa/")
+        version_match = re.search(r"/aas/(\d+)/aa$", path, re.I)
+        if version_match:
+            version = version_match.group(1)
+        base_url = base_url.rstrip("/") + "/"
+        os.environ["DOT_CATALOG_BASE_URL"] = base_url
+    elif not args.scan_only and not version.isdigit():
+        raise SystemExit("全量补充需要有效的 Bundle 基础地址，或纯数字 CDN 版本号，例如 8374。")
+    args.base_url = base_url
+    args.version = version
 
     default_report = TOOL_DIR / "reports" / ("catalog_story_mapping.json" if args.scan_only else "full_story_supplement.json")
     output = Path(args.output).expanduser().resolve() if args.output else default_report

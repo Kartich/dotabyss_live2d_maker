@@ -9,8 +9,9 @@ Output follows the character-package structure from test(4).py:
             <SpriteName>.png
         meta.json
 
-Important: Body and face sprites are exported separately; no final composed
-portrait is generated. Face sprite placement/restoration uses the validated
+Body and face sprites are extracted and merged into final portrait PNGs. The
+BackEffect sprite, when present, is treated as a native-size background layer,
+never as a face/expression. Face placement uses the validated
 RectTransform/FaceContent positioning logic from the earlier test(3) work.
 """
 from __future__ import annotations
@@ -494,9 +495,18 @@ def output_character(env, bundle: Path):
             continue
 
         body_data=None
+        background_data=None
         expression_list=[]
         for name,data in sprite_map.items():
-            low=name.lower()
+            low=name.lower().strip()
+            compact=re.sub(r'[^a-z0-9]', '', low)
+            # BackEffect is a stand background layer, not a facial expression.
+            # Keep it out of the expression-name list so it never receives a
+            # face code, face sizing, or face-anchor placement.
+            if compact.startswith('backeffect'):
+                if background_data is None or data['img_w']*data['img_h'] > background_data['img_w']*background_data['img_h']:
+                    background_data=data
+                continue
             # Stand prefab GameObject names are authoritative when available.
             if low == 'body' or low.startswith('body') or 'base' in low or low in ('stand','main'):
                 if body_data is None or data['img_w']*data['img_h'] > body_data['img_w']*body_data['img_h']:
@@ -558,13 +568,31 @@ def output_character(env, bundle: Path):
             sy=body_img.size[1]/face_info['body_h'] if face_info['body_h']>0 else 1.0
             target_fw=int(round(face_w*sx)); target_fh=int(round(face_h*sy))
 
+        # BackEffect is a native-size background. Build a canvas large enough
+        # for both layers and center each layer without resizing either one.
+        # When the source dimensions match (the normal case), both offsets are
+        # zero and pixel placement is unchanged.
+        if background_data is not None:
+            background_img=background_data['img'].copy().convert('RGBA')
+            canvas_w=max(background_img.width,body_img.width)
+            canvas_h=max(background_img.height,body_img.height)
+            background_offset=((canvas_w-background_img.width)//2,(canvas_h-background_img.height)//2)
+            body_offset=((canvas_w-body_img.width)//2,(canvas_h-body_img.height)//2)
+        else:
+            background_img=None
+            canvas_w,canvas_h=body_img.size
+            background_offset=(0,0)
+            body_offset=(0,0)
+
         for data in expression_list:
             expr_name=data['name']
             face_canvas=prepare_sprite_layer(data,target_fw,target_fh)
-            # Composite each expression onto the body in the final PNG. The
-            # body/face split remains only in the isolated temporary workspace;
-            # the final exporter copies merged portraits only.
-            composite=body_img.copy().convert('RGBA')
+            # Composite order: native-size BackEffect background -> body -> face.
+            # BackEffect is never scaled or processed as an expression layer.
+            composite=Image.new('RGBA',(canvas_w,canvas_h),(0,0,0,0))
+            if background_img is not None:
+                composite.alpha_composite(background_img,dest=background_offset)
+            composite.alpha_composite(body_img.convert('RGBA'),dest=body_offset)
             if face_info and face_info.get('body_w') and face_info.get('body_h'):
                 sx=body_img.size[0]/float(face_info['body_w'])
                 sy=body_img.size[1]/float(face_info['body_h'])
@@ -575,10 +603,14 @@ def output_character(env, bundle: Path):
             else:
                 px=(body_img.width-face_canvas.width)//2
                 py=(body_img.height-face_canvas.height)//2
+            # Face coordinates are relative to the body; translate them to the
+            # combined canvas before clipping at its boundaries.
+            px += body_offset[0]
+            py += body_offset[1]
             left=max(0,px); top=max(0,py)
             crop_l=max(0,-px); crop_t=max(0,-py)
-            crop_r=min(face_canvas.width,body_img.width-px)
-            crop_b=min(face_canvas.height,body_img.height-py)
+            crop_r=min(face_canvas.width,canvas_w-px)
+            crop_b=min(face_canvas.height,canvas_h-py)
             if crop_r>crop_l and crop_b>crop_t:
                 composite.alpha_composite(face_canvas.crop((crop_l,crop_t,crop_r,crop_b)),dest=(left,top))
             safe_expr=re.sub(r'[^A-Za-z0-9_一-鿿-]+','_',expr_name).strip('_') or 'Expression'
